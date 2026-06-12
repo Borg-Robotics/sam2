@@ -49,6 +49,13 @@ EXTRA_PACKAGES = {
         "pycocotools>=2.0.8",
         "strawberry-graphql>=0.243.0",
     ],
+    "borg": [
+        # Borg Robotics detection library (borg_vision/)
+        "depthai>=3.0",
+        "pyzbar>=0.1.9",
+        "opencv-python>=4.7.0",
+        "PyYAML>=5.4",
+    ],
     "dev": [
         "black==24.2.0",
         "usort==1.0.2",

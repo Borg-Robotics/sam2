@@ -1,0 +1,271 @@
+"""OAK-D camera ownership: depthai v3 pipeline, frame grabbing, intrinsics.
+
+Pipeline layout, IR/exposure settings and depth->RGB alignment are identical
+to the original product_detection_final.py script. Differences:
+- optional mxid selection for multi-camera setups,
+- output queues are maxSize=1 / non-blocking so a consumer that idles
+  between detections always receives the freshest frame without
+  backpressure on the device.
+"""
+
+from dataclasses import dataclass
+
+import cv2
+import depthai as dai
+import numpy as np
+
+
+@dataclass
+class Frames:
+    rgb: np.ndarray                    # BGR, rgb_size
+    depth_class_aligned: np.ndarray    # uint16 mm, rgb_size, aligned to RGB
+    depth_measure_aligned: np.ndarray  # uint16 mm, rgb_size, aligned to RGB
+
+
+def resize_depth_to_rgb_size(cfg, depth):
+    return cv2.resize(depth, cfg.rgb_size, interpolation=cv2.INTER_NEAREST)
+
+
+def align_depth_to_rgb(cfg, depth):
+    h, w = depth.shape[:2]
+    cx = w / 2.0
+    cy = h / 2.0
+
+    matrix = np.float32(
+        [
+            [
+                cfg.depth_align_scale_x,
+                0,
+                (1.0 - cfg.depth_align_scale_x) * cx + cfg.depth_align_x_shift_px,
+            ],
+            [
+                0,
+                cfg.depth_align_scale_y,
+                (1.0 - cfg.depth_align_scale_y) * cy + cfg.depth_align_y_shift_px,
+            ],
+        ]
+    )
+
+    return cv2.warpAffine(
+        depth,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def apply_manual_exposure(cfg, camera_node, label):
+    if not cfg.use_manual_stereo_exposure:
+        return
+
+    try:
+        camera_node.initialControl.setManualExposure(
+            cfg.stereo_exposure_us,
+            cfg.stereo_iso,
+        )
+        print(f"{label}: manual exposure {cfg.stereo_exposure_us} us ISO {cfg.stereo_iso}")
+    except Exception as e:
+        print(f"{label}: could not set manual exposure: {e}")
+
+
+def set_ir(cfg, device):
+    try:
+        device.setIrLaserDotProjectorIntensity(cfg.ir_laser_intensity)
+        print(f"IR laser set to {cfg.ir_laser_intensity}")
+    except Exception as e:
+        print(f"Could not set IR laser: {e}")
+
+    try:
+        device.setIrFloodLightIntensity(cfg.ir_flood_intensity)
+        print(f"IR flood set to {cfg.ir_flood_intensity}")
+    except Exception as e:
+        print(f"Could not set IR flood: {e}")
+
+
+def get_rgb_intrinsics(cfg, device):
+    try:
+        calibration = device.readCalibration()
+        intrinsics = calibration.getCameraIntrinsics(
+            dai.CameraBoardSocket.CAM_A,
+            cfg.rgb_size[0],
+            cfg.rgb_size[1],
+        )
+
+        return {
+            "fx": float(intrinsics[0][0]),
+            "fy": float(intrinsics[1][1]),
+            "cx": float(intrinsics[0][2]),
+            "cy": float(intrinsics[1][2]),
+        }
+
+    except Exception as e:
+        print(f"Could not read RGB intrinsics: {e}")
+        return None
+
+
+class OakCamera:
+    def __init__(self, cfg, mxid=None):
+        self.cfg = cfg
+        self.mxid = mxid
+
+        self._pipeline = None
+        self._device = None
+        self._intrinsics = None
+        self._rgb_queue = None
+        self._depth_class_queue = None
+        self._depth_measure_queue = None
+
+    def _build_pipeline(self):
+        cfg = self.cfg
+
+        if self.mxid:
+            device = dai.Device(dai.DeviceInfo(self.mxid))
+            pipeline = dai.Pipeline(device)
+        else:
+            pipeline = dai.Pipeline()
+
+        cam = pipeline.create(dai.node.Camera).build()
+
+        rgb_output = cam.requestOutput(
+            size=cfg.rgb_size,
+            type=dai.ImgFrame.Type.BGR888p,
+            fps=cfg.fps,
+        )
+
+        left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+        right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+
+        apply_manual_exposure(cfg, left, "left stereo")
+        apply_manual_exposure(cfg, right, "right stereo")
+
+        left_class_out = left.requestOutput(
+            size=cfg.rgb_size,
+            type=dai.ImgFrame.Type.GRAY8,
+            fps=cfg.fps,
+        )
+
+        right_class_out = right.requestOutput(
+            size=cfg.rgb_size,
+            type=dai.ImgFrame.Type.GRAY8,
+            fps=cfg.fps,
+        )
+
+        left_measure_out = left.requestOutput(
+            size=cfg.stereo_size,
+            type=dai.ImgFrame.Type.GRAY8,
+            fps=cfg.fps,
+        )
+
+        right_measure_out = right.requestOutput(
+            size=cfg.stereo_size,
+            type=dai.ImgFrame.Type.GRAY8,
+            fps=cfg.fps,
+        )
+
+        stereo_class = pipeline.create(dai.node.StereoDepth)
+        stereo_class.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+        stereo_class.setLeftRightCheck(cfg.use_left_right_check)
+        stereo_class.setSubpixel(cfg.use_subpixel)
+
+        try:
+            stereo_class.setOutputSize(cfg.rgb_size[0], cfg.rgb_size[1])
+            print(f"Classification stereo depth output size set to {cfg.rgb_size[0]}x{cfg.rgb_size[1]}.")
+        except Exception as e:
+            print(f"Could not set classification stereo output size: {e}")
+
+        try:
+            stereo_class.initialConfig.setConfidenceThreshold(cfg.confidence_threshold)
+            print(f"Classification confidence threshold set to {cfg.confidence_threshold}.")
+        except Exception as e:
+            print(f"Could not set classification confidence threshold: {e}")
+
+        stereo_measure = pipeline.create(dai.node.StereoDepth)
+        stereo_measure.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+        stereo_measure.setLeftRightCheck(cfg.use_left_right_check)
+        stereo_measure.setSubpixel(cfg.use_subpixel)
+
+        try:
+            stereo_measure.initialConfig.setConfidenceThreshold(cfg.confidence_threshold)
+            print(f"Measurement confidence threshold set to {cfg.confidence_threshold}.")
+        except Exception as e:
+            print(f"Could not set measurement confidence threshold: {e}")
+
+        left_class_out.link(stereo_class.left)
+        right_class_out.link(stereo_class.right)
+
+        left_measure_out.link(stereo_measure.left)
+        right_measure_out.link(stereo_measure.right)
+
+        self._rgb_queue = rgb_output.createOutputQueue(maxSize=1, blocking=False)
+        self._depth_class_queue = stereo_class.depth.createOutputQueue(maxSize=1, blocking=False)
+        self._depth_measure_queue = stereo_measure.depth.createOutputQueue(maxSize=1, blocking=False)
+
+        return pipeline
+
+    def open(self):
+        if self._pipeline is not None:
+            return self
+
+        self._pipeline = self._build_pipeline()
+        self._pipeline.start()
+
+        self._device = self._pipeline.getDefaultDevice()
+        set_ir(self.cfg, self._device)
+        self._intrinsics = get_rgb_intrinsics(self.cfg, self._device)
+
+        return self
+
+    @property
+    def intrinsics(self):
+        return self._intrinsics
+
+    @property
+    def is_running(self):
+        return self._pipeline is not None and self._pipeline.isRunning()
+
+    def get_frames(self):
+        """Block until a fresh frame triple is available and return it aligned."""
+        if self._pipeline is None:
+            raise RuntimeError("OakCamera is not open; call open() first")
+
+        cfg = self.cfg
+
+        rgb_msg = self._rgb_queue.get()
+        depth_class_msg = self._depth_class_queue.get()
+        depth_measure_msg = self._depth_measure_queue.get()
+
+        rgb = rgb_msg.getCvFrame()
+
+        depth_class_raw = depth_class_msg.getFrame()
+        depth_class_aligned = align_depth_to_rgb(cfg, depth_class_raw)
+
+        depth_measure_raw = depth_measure_msg.getFrame()
+        depth_measure_scaled = resize_depth_to_rgb_size(cfg, depth_measure_raw)
+        depth_measure_aligned = align_depth_to_rgb(cfg, depth_measure_scaled)
+
+        return Frames(
+            rgb=rgb,
+            depth_class_aligned=depth_class_aligned,
+            depth_measure_aligned=depth_measure_aligned,
+        )
+
+    def close(self):
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception as e:
+                print(f"Error stopping pipeline: {e}")
+
+        self._pipeline = None
+        self._device = None
+        self._rgb_queue = None
+        self._depth_class_queue = None
+        self._depth_measure_queue = None
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
