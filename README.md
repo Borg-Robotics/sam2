@@ -1,5 +1,24 @@
 # SAM 2: Segment Anything in Images and Videos
 
+> ## Borg Robotics fork
+>
+> This fork adds OAK-D Pro detection tooling for the Borg return-station demo
+> on top of unmodified upstream SAM 2:
+>
+> - **[`borg_vision/`](borg_vision/README.md)** — importable, GUI-free
+>   detection library (depthai v3 camera ownership, barcode-gated SAM2
+>   package detection, box/polymailer classification, dimensions + camera-frame
+>   center point). Used by the ROS2 `sam2_vision` package in
+>   [borg_cobots](https://github.com/Borg-Robotics/borg_cobots).
+>   Install with `pip install -e ".[borg]"`.
+> - `product_detection_final.py` — interactive CLI for the above (SPACE = scan,
+>   q = quit); now a thin shim over `borg_vision`.
+> - `box_detection_final.py`, `polymailer_final.py`, `clear_bag_final.py`,
+>   `object_detection_final.py` — standalone detection scripts (not yet
+>   ported into the library).
+>
+> Upstream README follows below.
+
 **[AI at Meta, FAIR](https://ai.meta.com/research/)**
 
 [Nikhila Ravi](https://nikhilaravi.com/), [Valentin Gabeur](https://gabeur.github.io/), [Yuan-Ting Hu](https://scholar.google.com/citations?user=E8DVVYQAAAAJ&hl=en), [Ronghang Hu](https://ronghanghu.com/), [Chaitanya Ryali](https://scholar.google.com/citations?user=4LWx24UAAAAJ&hl=en), [Tengyu Ma](https://scholar.google.com/citations?user=VeTSl0wAAAAJ&hl=en), [Haitham Khedr](https://hkhedr.com/), [Roman Rädle](https://scholar.google.de/citations?user=Tpt57v0AAAAJ&hl=en), [Chloe Rolland](https://scholar.google.com/citations?hl=fr&user=n-SnMhoAAAAJ), [Laura Gustafson](https://scholar.google.com/citations?user=c8IpF9gAAAAJ&hl=en), [Eric Mintun](https://ericmintun.github.io/), [Junting Pan](https://junting.github.io/), [Kalyan Vasudev Alwala](https://scholar.google.co.in/citations?user=m34oaWEAAAAJ&hl=en), [Nicolas Carion](https://www.nicolascarion.com/), [Chao-Yuan Wu](https://chaoyuan.org/), [Ross Girshick](https://www.rossgirshick.info/), [Piotr Dollár](https://pdollar.github.io/), [Christoph Feichtenhofer](https://feichtenhofer.github.io/)
