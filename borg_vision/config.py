@@ -43,7 +43,7 @@ class ProductDetectionConfig:
     min_valid_depth_mm: float = 450
     max_valid_depth_mm: float = 1200
 
-    base_depth_mm: float = 700.0
+    base_depth_mm: float = 695.0
     measurement_depth_offset_mm: float = 10.0
     package_size_scale: float = 1.04
 
