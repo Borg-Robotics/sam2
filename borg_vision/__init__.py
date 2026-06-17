@@ -15,12 +15,14 @@ aliases of the `Package*` classes.
 
 from .config import (
     BaseConfig,
+    BoxConfig,
     ObjectConfig,
     PackageConfig,
     ProductDetectionConfig,
 )
 from .detectors import (
     BaseDetector,
+    BoxDetector,
     ObjectDetector,
     PackageDetector,
     ProductDetector,
@@ -33,6 +35,7 @@ from .registry import (
 )
 from .results import (
     BaseResult,
+    BoxResult,
     ObjectResult,
     PackageResult,
     ProductDetectionResult,
@@ -56,6 +59,10 @@ __all__ = [
     "ObjectConfig",
     "ObjectDetector",
     "ObjectResult",
+    # box mode
+    "BoxConfig",
+    "BoxDetector",
+    "BoxResult",
     # backwards-compatible aliases
     "ProductDetectionConfig",
     "ProductDetector",

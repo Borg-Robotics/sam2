@@ -7,6 +7,7 @@ product_detection CLI) keep importing it unchanged.
 """
 
 from .base import BaseConfig
+from .box import BoxConfig
 from .object import ObjectConfig
 from .package import PackageConfig
 
@@ -17,5 +18,6 @@ __all__ = [
     "BaseConfig",
     "PackageConfig",
     "ObjectConfig",
+    "BoxConfig",
     "ProductDetectionConfig",
 ]
