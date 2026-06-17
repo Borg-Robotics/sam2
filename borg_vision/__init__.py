@@ -16,15 +16,19 @@ aliases of the `Package*` classes.
 from .config import (
     BaseConfig,
     BoxConfig,
+    ClearBagConfig,
     ObjectConfig,
     PackageConfig,
+    PolymailerConfig,
     ProductDetectionConfig,
 )
 from .detectors import (
     BaseDetector,
     BoxDetector,
+    ClearBagDetector,
     ObjectDetector,
     PackageDetector,
+    PolymailerDetector,
     ProductDetector,
 )
 from .registry import (
@@ -36,8 +40,10 @@ from .registry import (
 from .results import (
     BaseResult,
     BoxResult,
+    ClearBagResult,
     ObjectResult,
     PackageResult,
+    PolymailerResult,
     ProductDetectionResult,
 )
 
@@ -63,6 +69,14 @@ __all__ = [
     "BoxConfig",
     "BoxDetector",
     "BoxResult",
+    # polymailer mode
+    "PolymailerConfig",
+    "PolymailerDetector",
+    "PolymailerResult",
+    # clear_bag mode
+    "ClearBagConfig",
+    "ClearBagDetector",
+    "ClearBagResult",
     # backwards-compatible aliases
     "ProductDetectionConfig",
     "ProductDetector",

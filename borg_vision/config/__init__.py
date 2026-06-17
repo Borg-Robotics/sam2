@@ -8,8 +8,10 @@ product_detection CLI) keep importing it unchanged.
 
 from .base import BaseConfig
 from .box import BoxConfig
+from .clear_bag import ClearBagConfig
 from .object import ObjectConfig
 from .package import PackageConfig
+from .polymailer import PolymailerConfig
 
 # Backwards-compatible alias for the pre-refactor single-mode config name.
 ProductDetectionConfig = PackageConfig
@@ -19,5 +21,7 @@ __all__ = [
     "PackageConfig",
     "ObjectConfig",
     "BoxConfig",
+    "PolymailerConfig",
+    "ClearBagConfig",
     "ProductDetectionConfig",
 ]

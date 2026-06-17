@@ -110,5 +110,61 @@ class BoxResult(BaseResult):
         return make_json_result(cfg, self.raw, timestamp)
 
 
+@dataclass
+class PolymailerResult(BaseResult):
+    """Polymailer measurement + product bulge inside (units: mm / deg, camera
+    frame: x right, y down, z = depth forward)."""
+
+    polymailer_face_depth_mm: Optional[float] = None
+    polymailer_depth_mm: Optional[float] = None
+    length_mm: Optional[float] = None
+    width_mm: Optional[float] = None
+    angle_deg: Optional[float] = None
+    center_x_mm: Optional[float] = None
+    center_y_mm: Optional[float] = None
+    product_inside_found: bool = False
+    product_inside_center_x_mm: Optional[float] = None
+    product_inside_center_y_mm: Optional[float] = None
+    product_inside_center_face_depth: Optional[float] = None
+
+    @classmethod
+    def from_raw(cls, raw, frames):
+        return cls(raw=raw, frames=frames, **raw["final_output"])
+
+    def to_json_dict(self, cfg, timestamp=None):
+        from .visualization.polymailer import make_json_result
+
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return make_json_result(cfg, self.raw, timestamp)
+
+
+@dataclass
+class ClearBagResult(BaseResult):
+    """Clear-bag measurement + visible product inside (units: mm / deg, camera
+    frame: x right, y down, z = depth forward)."""
+
+    product_face_depth_mm: Optional[float] = None
+    clearbag_depth_mm: Optional[float] = None
+    length_mm: Optional[float] = None
+    width_mm: Optional[float] = None
+    angle_deg: Optional[float] = None
+    center_x_mm: Optional[float] = None
+    center_y_mm: Optional[float] = None
+    product_inside_center_x_mm: Optional[float] = None
+    product_inside_center_y_mm: Optional[float] = None
+
+    @classmethod
+    def from_raw(cls, raw, frames):
+        return cls(raw=raw, frames=frames, **raw["final_output"])
+
+    def to_json_dict(self, cfg, timestamp=None):
+        from .visualization.clear_bag import make_json_result
+
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return make_json_result(cfg, self.raw, timestamp)
+
+
 # Backwards-compatible alias for the pre-refactor single-mode result name.
 ProductDetectionResult = PackageResult

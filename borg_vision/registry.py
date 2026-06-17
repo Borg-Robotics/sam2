@@ -5,16 +5,28 @@ use to obtain a configured detector for a given station/mode. New modes are
 registered in MODES as they are ported from unified_detector_all_in_one.py.
 """
 
-from .config import BoxConfig, ObjectConfig, PackageConfig
-from .detectors import BoxDetector, ObjectDetector, PackageDetector
+from .config import (
+    BoxConfig,
+    ClearBagConfig,
+    ObjectConfig,
+    PackageConfig,
+    PolymailerConfig,
+)
+from .detectors import (
+    BoxDetector,
+    ClearBagDetector,
+    ObjectDetector,
+    PackageDetector,
+    PolymailerDetector,
+)
 
 #: mode name -> (detector class, config class)
 MODES = {
     "package": (PackageDetector, PackageConfig),
     "object": (ObjectDetector, ObjectConfig),
     "box": (BoxDetector, BoxConfig),
-    # "clear_bag":  (ClearBagDetector, ClearBagConfig),   # added in step 4
-    # "polymailer": (PolymailerDetector, PolymailerConfig),
+    "polymailer": (PolymailerDetector, PolymailerConfig),
+    "clear_bag": (ClearBagDetector, ClearBagConfig),
 }
 
 # Aliases so callers can use either the station name or the legacy "product".
