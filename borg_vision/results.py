@@ -63,5 +63,27 @@ class PackageResult(BaseResult):
         return make_json_result(cfg, self.raw, timestamp)
 
 
+@dataclass
+class ObjectResult(BaseResult):
+    """Generic object segmentation + center depth (units: mm, pixels in the
+    full RGB frame)."""
+
+    center_pixel_u: Optional[int] = None
+    center_pixel_v: Optional[int] = None
+    distance_mm: Optional[float] = None
+    depth_count: int = 0
+
+    @classmethod
+    def from_raw(cls, raw, frames):
+        return cls(raw=raw, frames=frames, **raw["final_output"])
+
+    def to_json_dict(self, cfg, timestamp=None):
+        from .visualization.object import make_json_result
+
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return make_json_result(cfg, self.raw, timestamp)
+
+
 # Backwards-compatible alias for the pre-refactor single-mode result name.
 ProductDetectionResult = PackageResult

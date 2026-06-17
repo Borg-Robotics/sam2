@@ -1,0 +1,110 @@
+"""Object segmentation + center-depth mode (no barcode gate).
+
+ObjectDetector runs SAM2 on the ROI, picks the best generic object mask and
+reports its center pixel and center depth. Behaviour is a verbatim port of
+run_object()/object_detection_final.py; only the shared lifecycle now lives in
+BaseDetector.
+"""
+
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from ..config import ObjectConfig
+from ..detection import run_sam2_object_segmentation
+from ..results import ObjectResult
+from ..visualization.object import draw_result, make_json_result
+from .base import BaseDetector
+
+
+class ObjectDetector(BaseDetector):
+    config_class = ObjectConfig
+    requires_barcode = False
+
+    def detect(self, frames, barcode=None):
+        """Run SAM2 object segmentation + center depth on the given frames.
+
+        Returns ObjectResult or None when no valid object mask was found. The
+        center depth is measured from the classification depth (object mode has
+        no separate measurement stereo).
+        """
+        if self._mask_generator is None:
+            raise RuntimeError("Model not loaded; call load_model() first")
+
+        raw = run_sam2_object_segmentation(
+            self.cfg,
+            frames.rgb,
+            frames.depth_class_aligned,
+            self._mask_generator,
+        )
+
+        if raw is None:
+            return None
+
+        return ObjectResult.from_raw(raw, frames)
+
+    # ---------------------------------------------------------- visualization
+
+    def _draw_result(self, result):
+        return draw_result(
+            self.cfg,
+            result.frames.rgb,
+            result.frames.depth_class_aligned,
+            result.raw,
+        )
+
+    def _serialize(self, result, timestamp=None):
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return make_json_result(self.cfg, result.raw, timestamp)
+
+    def _debug_artifacts(self, result):
+        # The object mask (saved via save_binary_mask by the base template).
+        return {"object_mask": result.raw["object"]["mask"]}
+
+    def save_debug(self, result, out_dir=None, timestamp=None):
+        """Same artifact set as the original object script (keys: dir, raw_rgb,
+        depth_aligned, result, mask, json, result_bgr).
+
+        Note: the pre-alignment raw depth is not retained by the library camera,
+        so only the aligned depth is dumped as .npy.
+        """
+        cfg = self.cfg
+
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        save_dir = Path(out_dir) if out_dir is not None else Path(cfg.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        result_bgr = self._draw_result(result)
+
+        from ..visualization import save_binary_mask
+
+        raw_path = save_dir / f"raw_rgb_{timestamp}.jpg"
+        depth_aligned_path = save_dir / f"depth_aligned_{timestamp}.npy"
+        result_path = save_dir / f"object_segment_depth_{timestamp}.png"
+        mask_path = save_dir / f"object_mask_{timestamp}.png"
+        json_path = save_dir / f"object_segment_depth_{timestamp}.json"
+
+        cv2.imwrite(str(raw_path), result.frames.rgb)
+        np.save(str(depth_aligned_path), result.frames.depth_class_aligned)
+        cv2.imwrite(str(result_path), result_bgr)
+        save_binary_mask(mask_path, result.raw["object"]["mask"])
+
+        import json
+
+        with open(json_path, "w") as f:
+            json.dump(make_json_result(cfg, result.raw, timestamp), f, indent=2)
+
+        return {
+            "dir": save_dir,
+            "raw_rgb": raw_path,
+            "depth_aligned": depth_aligned_path,
+            "result": result_path,
+            "mask": mask_path,
+            "json": json_path,
+            "result_bgr": result_bgr,
+        }

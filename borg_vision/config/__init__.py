@@ -7,6 +7,7 @@ product_detection CLI) keep importing it unchanged.
 """
 
 from .base import BaseConfig
+from .object import ObjectConfig
 from .package import PackageConfig
 
 # Backwards-compatible alias for the pre-refactor single-mode config name.
@@ -15,5 +16,6 @@ ProductDetectionConfig = PackageConfig
 __all__ = [
     "BaseConfig",
     "PackageConfig",
+    "ObjectConfig",
     "ProductDetectionConfig",
 ]

@@ -13,15 +13,30 @@ Backwards compatibility: `ProductDetectionConfig`, `ProductDetector` and
 aliases of the `Package*` classes.
 """
 
-from .config import BaseConfig, PackageConfig, ProductDetectionConfig
-from .detectors import BaseDetector, PackageDetector, ProductDetector
+from .config import (
+    BaseConfig,
+    ObjectConfig,
+    PackageConfig,
+    ProductDetectionConfig,
+)
+from .detectors import (
+    BaseDetector,
+    ObjectDetector,
+    PackageDetector,
+    ProductDetector,
+)
 from .registry import (
     available_modes,
     config_class_for,
     get_detector,
     resolve_mode,
 )
-from .results import BaseResult, PackageResult, ProductDetectionResult
+from .results import (
+    BaseResult,
+    ObjectResult,
+    PackageResult,
+    ProductDetectionResult,
+)
 
 __all__ = [
     # factory / registry
@@ -37,6 +52,10 @@ __all__ = [
     "PackageConfig",
     "PackageDetector",
     "PackageResult",
+    # object mode
+    "ObjectConfig",
+    "ObjectDetector",
+    "ObjectResult",
     # backwards-compatible aliases
     "ProductDetectionConfig",
     "ProductDetector",

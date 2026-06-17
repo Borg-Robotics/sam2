@@ -1,16 +1,17 @@
-"""Pure detection logic: mask scoring, classification, dimensions, depth stats.
+"""Package-mode detection logic: mask scoring, classification, dimensions,
+depth stats.
 
 All functions are ports of the original product_detection_final.py with the
-module-level constants replaced by fields of a ProductDetectionConfig passed
-as the first argument. Function bodies are otherwise unchanged.
+module-level constants replaced by fields of a PackageConfig passed as the
+first argument. Function bodies are otherwise unchanged.
 """
 
 import cv2
 import numpy as np
 import torch
 
-from .utils import fmt3, score_from_bad_good, score_from_range
-from .visualization import make_package_depth_heatmap
+from ..utils import fmt3, score_from_bad_good, score_from_range
+from ..visualization import make_package_depth_heatmap
 
 
 def pixel_to_camera_xy_mm(center_full, depth_mm, intrinsics):

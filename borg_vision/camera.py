@@ -152,18 +152,6 @@ class OakCamera:
             fps=cfg.fps,
         )
 
-        left_measure_out = left.requestOutput(
-            size=cfg.stereo_size,
-            type=dai.ImgFrame.Type.GRAY8,
-            fps=cfg.fps,
-        )
-
-        right_measure_out = right.requestOutput(
-            size=cfg.stereo_size,
-            type=dai.ImgFrame.Type.GRAY8,
-            fps=cfg.fps,
-        )
-
         stereo_class = pipeline.create(dai.node.StereoDepth)
         stereo_class.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
         stereo_class.setLeftRightCheck(cfg.use_left_right_check)
@@ -181,26 +169,46 @@ class OakCamera:
         except Exception as e:
             print(f"Could not set classification confidence threshold: {e}")
 
-        stereo_measure = pipeline.create(dai.node.StereoDepth)
-        stereo_measure.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
-        stereo_measure.setLeftRightCheck(cfg.use_left_right_check)
-        stereo_measure.setSubpixel(cfg.use_subpixel)
-
-        try:
-            stereo_measure.initialConfig.setConfidenceThreshold(cfg.confidence_threshold)
-            print(f"Measurement confidence threshold set to {cfg.confidence_threshold}.")
-        except Exception as e:
-            print(f"Could not set measurement confidence threshold: {e}")
-
         left_class_out.link(stereo_class.left)
         right_class_out.link(stereo_class.right)
 
-        left_measure_out.link(stereo_measure.left)
-        right_measure_out.link(stereo_measure.right)
-
         self._rgb_queue = rgb_output.createOutputQueue(maxSize=1, blocking=False)
         self._depth_class_queue = stereo_class.depth.createOutputQueue(maxSize=1, blocking=False)
-        self._depth_measure_queue = stereo_measure.depth.createOutputQueue(maxSize=1, blocking=False)
+
+        # Modes that measure from a separate, lower-resolution stereo stream
+        # (package, box) build a second StereoDepth node. Modes that reuse the
+        # classification depth for measurement (object, clear_bag, polymailer)
+        # skip it, and get_frames() falls back to the classification depth.
+        if cfg.needs_measurement_stereo:
+            left_measure_out = left.requestOutput(
+                size=cfg.stereo_size,
+                type=dai.ImgFrame.Type.GRAY8,
+                fps=cfg.fps,
+            )
+
+            right_measure_out = right.requestOutput(
+                size=cfg.stereo_size,
+                type=dai.ImgFrame.Type.GRAY8,
+                fps=cfg.fps,
+            )
+
+            stereo_measure = pipeline.create(dai.node.StereoDepth)
+            stereo_measure.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+            stereo_measure.setLeftRightCheck(cfg.use_left_right_check)
+            stereo_measure.setSubpixel(cfg.use_subpixel)
+
+            try:
+                stereo_measure.initialConfig.setConfidenceThreshold(cfg.confidence_threshold)
+                print(f"Measurement confidence threshold set to {cfg.confidence_threshold}.")
+            except Exception as e:
+                print(f"Could not set measurement confidence threshold: {e}")
+
+            left_measure_out.link(stereo_measure.left)
+            right_measure_out.link(stereo_measure.right)
+
+            self._depth_measure_queue = stereo_measure.depth.createOutputQueue(
+                maxSize=1, blocking=False
+            )
 
         return pipeline
 
@@ -234,16 +242,21 @@ class OakCamera:
 
         rgb_msg = self._rgb_queue.get()
         depth_class_msg = self._depth_class_queue.get()
-        depth_measure_msg = self._depth_measure_queue.get()
 
         rgb = rgb_msg.getCvFrame()
 
         depth_class_raw = depth_class_msg.getFrame()
         depth_class_aligned = align_depth_to_rgb(cfg, depth_class_raw)
 
-        depth_measure_raw = depth_measure_msg.getFrame()
-        depth_measure_scaled = resize_depth_to_rgb_size(cfg, depth_measure_raw)
-        depth_measure_aligned = align_depth_to_rgb(cfg, depth_measure_scaled)
+        if self._depth_measure_queue is not None:
+            depth_measure_msg = self._depth_measure_queue.get()
+            depth_measure_raw = depth_measure_msg.getFrame()
+            depth_measure_scaled = resize_depth_to_rgb_size(cfg, depth_measure_raw)
+            depth_measure_aligned = align_depth_to_rgb(cfg, depth_measure_scaled)
+        else:
+            # No dedicated measurement stream: reuse the classification depth so
+            # Frames stays the same shape for every mode.
+            depth_measure_aligned = depth_class_aligned
 
         return Frames(
             rgb=rgb,
