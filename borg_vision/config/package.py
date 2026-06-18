@@ -78,6 +78,43 @@ class PackageConfig(BaseConfig):
     box_mask_close_iterations: int = 1
     box_max_cleaned_area_growth: float = 2.8
 
+    # ----- dedicated exact-box path on the same package-ROI masks -------
+    dedicated_box_sam_enable: bool = True
+
+    # ----- full-box override (prefer a complete cardboard mask) ---------
+    box_full_mask_override_enable: bool = True
+    box_full_mask_min_package_containment: float = 0.72
+    box_full_mask_min_area_growth: float = 1.30
+    box_full_mask_strong_color_score: float = 0.45
+    box_full_mask_strong_rectangularity: float = 0.75
+
+    # ----- split-mask merge repair (rejoin box halves) -----------------
+    box_merge_split_masks_enable: bool = True
+    box_merge_max_candidates: int = 14
+    box_merge_min_horizontal_overlap: float = 0.55
+    box_merge_max_center_x_diff_ratio: float = 0.35
+    box_merge_max_width_ratio: float = 1.80
+    box_merge_max_vertical_gap_px: int = 90
+    box_merge_max_pair_iou: float = 0.65
+    box_merge_min_area_growth_over_largest: float = 1.20
+    box_merge_min_result_rectangularity: float = 0.72
+    box_merge_score_bonus: float = 0.85
+
+    # ----- segmentation box-type override / thin-polymailer veto -------
+    box_type_segmentation_override_enable: bool = True
+    box_type_segmentation_min_score: float = 5.25
+    box_type_segmentation_min_color_score: float = 0.65
+    box_type_segmentation_min_rectangularity: float = 0.82
+    box_type_segmentation_min_area_ratio: float = 0.08
+    box_type_segmentation_min_confidence: float = 0.90
+
+    box_type_polymailer_veto_enable: bool = True
+    box_type_polymailer_veto_max_package_depth_mm: float = 65.0
+    box_type_polymailer_hard_thin_max_depth_mm: float = 45.0
+    box_type_polymailer_hard_thin_min_poly_score: float = 0.55
+    box_type_polymailer_veto_min_poly_score: float = 0.68
+    box_type_polymailer_veto_min_signal_count: int = 1
+
     box_flat_std_good_mm: float = 6.0
     box_flat_std_bad_mm: float = 18.0
 

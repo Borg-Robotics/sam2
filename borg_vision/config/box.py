@@ -61,4 +61,24 @@ class BoxConfig(BaseConfig):
     box_sam_iou_score_weight: float = 0.4
     box_sam_stability_score_weight: float = 0.4
 
+    # Full-box override: prefer a larger mask that contains a partial box mask.
+    box_full_mask_override_enable: bool = True
+    box_full_mask_min_partial_containment: float = 0.72
+    box_full_mask_min_area_growth: float = 1.25
+    box_full_mask_max_score_drop: float = 0.80
+    box_full_mask_min_color_score: float = 0.25
+    box_full_mask_min_rectangularity: float = 0.35
+
+    # Split-mask repair: rejoin two box halves split by a seam.
+    box_merge_split_masks_enable: bool = True
+    box_merge_max_candidates: int = 14
+    box_merge_min_axis_overlap: float = 0.55
+    box_merge_max_center_diff_ratio: float = 0.35
+    box_merge_max_size_ratio: float = 1.80
+    box_merge_max_gap_px: int = 90
+    box_merge_max_pair_iou: float = 0.65
+    box_merge_min_area_growth_over_largest: float = 1.20
+    box_merge_min_result_rectangularity: float = 0.72
+    box_merge_score_bonus: float = 0.85
+
     debug_print_masks: bool = False

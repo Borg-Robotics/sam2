@@ -14,6 +14,14 @@ from ..utils import fmt3, score_from_bad_good, score_from_range
 from ..visualization import make_package_depth_heatmap
 
 
+# Mask sources whose strong RGB segmentation evidence is allowed to override
+# the depth-based package type. Fixed set literal (not a config field).
+BOX_TYPE_SEGMENTATION_OVERRIDE_SOURCES = {
+    "package_roi_exact_box_rules",
+    "cardboard_box_merged_masks",
+}
+
+
 def pixel_to_camera_xy_mm(center_full, depth_mm, intrinsics):
     if center_full is None or depth_mm is None or intrinsics is None:
         return None, None
@@ -509,11 +517,215 @@ def score_cardboard_box_mask(cfg, mask, roi_rgb, sam_iou, sam_stability):
     }, "ok"
 
 
-def choose_best_package_mask(cfg, masks, roi_rgb):
-    best = None
+def mask_overlap_fraction(inner_mask, outer_mask):
+    inner_mask = inner_mask.astype(bool)
+    outer_mask = outer_mask.astype(bool)
+
+    inner_area = int(inner_mask.sum())
+
+    if inner_area <= 0:
+        return 0.0
+
+    overlap = int(np.logical_and(inner_mask, outer_mask).sum())
+
+    return float(overlap / inner_area)
+
+
+def mask_iou(mask_a, mask_b):
+    a = mask_a.astype(bool)
+    b = mask_b.astype(bool)
+
+    union = int(np.logical_or(a, b).sum())
+
+    if union <= 0:
+        return 0.0
+
+    intersection = int(np.logical_and(a, b).sum())
+    return float(intersection / union)
+
+
+def horizontal_overlap_fraction(bbox_a, bbox_b):
+    ax, ay, aw, ah = bbox_a
+    bx, by, bw, bh = bbox_b
+
+    left = max(ax, bx)
+    right = min(ax + aw, bx + bw)
+    overlap = max(0, right - left)
+
+    return float(overlap / max(min(aw, bw), 1))
+
+
+def vertical_gap_px(bbox_a, bbox_b):
+    ax, ay, aw, ah = bbox_a
+    bx, by, bw, bh = bbox_b
+
+    a_bottom = ay + ah
+    b_bottom = by + bh
+
+    if a_bottom < by:
+        return int(by - a_bottom)
+
+    if b_bottom < ay:
+        return int(ay - b_bottom)
+
+    return 0
+
+
+def complete_min_area_rectangle(mask):
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if len(contours) == 0:
+        return None
+
+    points = np.vstack(contours)
+
+    if points.shape[0] < 4:
+        return None
+
+    rect = cv2.minAreaRect(points)
+    box_points = cv2.boxPoints(rect)
+    box_points = np.intp(np.round(box_points))
+
+    completed = np.zeros_like(mask, dtype=np.uint8)
+    cv2.fillConvexPoly(completed, box_points, 1)
+
+    return completed
+
+
+def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
+    if not cfg.box_merge_split_masks_enable:
+        return None
+
+    if len(box_candidates) < 2:
+        return None
+
+    candidates = sorted(
+        box_candidates,
+        key=lambda item: item.get("area", int(item["mask"].sum())),
+        reverse=True,
+    )[:cfg.box_merge_max_candidates]
+
+    best_merged = None
+
+    for i in range(len(candidates)):
+        first = candidates[i]
+        first_bbox = first["bbox"]
+        first_area = int(first["mask"].sum())
+
+        for j in range(i + 1, len(candidates)):
+            second = candidates[j]
+            second_bbox = second["bbox"]
+            second_area = int(second["mask"].sum())
+
+            pair_iou = mask_iou(first["mask"], second["mask"])
+
+            # Near-duplicate masks do not represent two separate box halves.
+            if pair_iou > cfg.box_merge_max_pair_iou:
+                continue
+
+            x_overlap = horizontal_overlap_fraction(first_bbox, second_bbox)
+
+            if x_overlap < cfg.box_merge_min_horizontal_overlap:
+                continue
+
+            fx, fy, fw, fh = first_bbox
+            sx, sy, sw, sh = second_bbox
+
+            width_ratio = max(fw, sw) / max(min(fw, sw), 1)
+
+            if width_ratio > cfg.box_merge_max_width_ratio:
+                continue
+
+            first_cx = fx + fw / 2.0
+            second_cx = sx + sw / 2.0
+            center_x_diff_ratio = abs(first_cx - second_cx) / max(max(fw, sw), 1)
+
+            if center_x_diff_ratio > cfg.box_merge_max_center_x_diff_ratio:
+                continue
+
+            gap_px = vertical_gap_px(first_bbox, second_bbox)
+
+            if gap_px > cfg.box_merge_max_vertical_gap_px:
+                continue
+
+            union_mask = np.logical_or(
+                first["mask"].astype(bool),
+                second["mask"].astype(bool),
+            ).astype(np.uint8)
+
+            completed_mask = complete_min_area_rectangle(union_mask)
+
+            if completed_mask is None:
+                continue
+
+            largest_fragment_area = max(first_area, second_area)
+            completed_area = int(completed_mask.sum())
+            area_growth = completed_area / max(largest_fragment_area, 1)
+
+            if area_growth < cfg.box_merge_min_area_growth_over_largest:
+                continue
+
+            merged_result, merged_reason = score_cardboard_box_mask(
+                cfg,
+                completed_mask,
+                roi_rgb,
+                max(first.get("sam_iou", 0.0), second.get("sam_iou", 0.0)),
+                max(
+                    first.get("sam_stability", 0.0),
+                    second.get("sam_stability", 0.0),
+                ),
+            )
+
+            if merged_result is None:
+                continue
+
+            if (
+                merged_result["rectangularity"]
+                < cfg.box_merge_min_result_rectangularity
+            ):
+                continue
+
+            merged_result["source"] = "cardboard_box_merged_masks"
+            merged_result["selection_override"] = "merged_split_box_masks"
+            merged_result["reason"] = merged_reason
+            merged_result["merged_from_indices"] = [
+                int(first["index"]),
+                int(second["index"]),
+            ]
+            merged_result["merged_pair_iou"] = float(pair_iou)
+            merged_result["merged_horizontal_overlap"] = float(x_overlap)
+            merged_result["merged_vertical_gap_px"] = int(gap_px)
+            merged_result["merged_area_growth"] = float(area_growth)
+            merged_result["score_before_merge_bonus"] = float(
+                merged_result["score"]
+            )
+            merged_result["score"] = float(
+                merged_result["score"] + cfg.box_merge_score_bonus
+            )
+
+            if (
+                best_merged is None
+                or merged_result["score"] > best_merged["score"]
+            ):
+                best_merged = merged_result
+
+    return best_merged
+
+
+def choose_best_package_mask_from_package_roi(cfg, masks, roi_rgb):
+    best_package = None
+    best_box = None
+    box_candidates = []
     accepted = []
 
-    print("\nChecking SAM 2 masks with package/product rules + exact box rules...")
+    print(
+        "\nChecking SAM 2 masks with package/product rules "
+        "+ exact cardboard box rules..."
+    )
 
     for i, m in enumerate(masks):
         raw_mask = m["segmentation"].astype(np.uint8)
@@ -521,6 +733,7 @@ def choose_best_package_mask(cfg, masks, roi_rgb):
         sam_iou = float(m.get("predicted_iou", 0.0))
         sam_stability = float(m.get("stability_score", 0.0))
 
+        # General package / polymailer scoring path.
         package_mask = clean_package_mask(cfg, raw_mask)
         package_result, package_reason = score_package_product_mask(
             cfg,
@@ -535,9 +748,13 @@ def choose_best_package_mask(cfg, masks, roi_rgb):
             package_result["reason"] = package_reason
             accepted.append(package_result)
 
-            if best is None or package_result["score"] > best["score"]:
-                best = package_result
+            if (
+                best_package is None
+                or package_result["score"] > best_package["score"]
+            ):
+                best_package = package_result
 
+        # Exact cardboard-box scoring path.
         box_mask = clean_box_mask(cfg, raw_mask)
         box_result, box_reason = score_cardboard_box_mask(
             cfg,
@@ -550,12 +767,419 @@ def choose_best_package_mask(cfg, masks, roi_rgb):
         if box_result is not None:
             box_result["index"] = i
             box_result["reason"] = box_reason
+            box_candidates.append(box_result)
             accepted.append(box_result)
 
-            if best is None or box_result["score"] > best["score"]:
-                best = box_result
+            if best_box is None or box_result["score"] > best_box["score"]:
+                best_box = box_result
 
-    return best, accepted
+    merged_box = build_merged_cardboard_box_candidate(
+        cfg,
+        box_candidates,
+        roi_rgb,
+    )
+
+    if merged_box is not None:
+        accepted.append(merged_box)
+
+        print()
+        print("MERGED SPLIT BOX CANDIDATE FOUND")
+        print(
+            "  merged SAM indices:       "
+            f"{merged_box['merged_from_indices']}"
+        )
+        print(
+            "  horizontal overlap:       "
+            f"{merged_box['merged_horizontal_overlap']:.3f}"
+        )
+        print(
+            "  vertical gap px:          "
+            f"{merged_box['merged_vertical_gap_px']}"
+        )
+        print(
+            "  area growth over fragment:"
+            f" {merged_box['merged_area_growth']:.3f}"
+        )
+        print(
+            "  merged box score:         "
+            f"{merged_box['score']:.3f}"
+        )
+
+        if best_box is None or merged_box["score"] > best_box["score"]:
+            best_box = merged_box
+
+    if best_package is None and best_box is None:
+        return None, accepted
+
+    if best_package is None:
+        best_box["selection_override"] = "only_box_candidate"
+        print("Selected cardboard-box candidate: no general candidate.")
+        return best_box, accepted
+
+    if best_box is None:
+        best_package["selection_override"] = "only_package_candidate"
+        print("Selected general package candidate: no box candidate.")
+        return best_package, accepted
+
+    package_area = int(best_package["mask"].sum())
+    box_area = int(best_box["mask"].sum())
+
+    package_inside_box = mask_overlap_fraction(
+        best_package["mask"],
+        best_box["mask"],
+    )
+
+    box_inside_package = mask_overlap_fraction(
+        best_box["mask"],
+        best_package["mask"],
+    )
+
+    area_growth = box_area / max(package_area, 1)
+
+    box_color_score = best_box.get("color_score")
+
+    if box_color_score is None:
+        box_color_score = 0.0
+
+    box_rectangularity = best_box.get("rectangularity", 0.0)
+    box_area_ratio = best_box.get("area_ratio", 0.0)
+
+    # Main full-box override. The general candidate lies mostly inside the
+    # cardboard candidate, while the cardboard candidate is substantially
+    # larger and still passes the original box color and geometry rules.
+    full_box_override = (
+        cfg.box_full_mask_override_enable
+        and package_inside_box >= cfg.box_full_mask_min_package_containment
+        and area_growth >= cfg.box_full_mask_min_area_growth
+        and box_color_score >= cfg.min_box_color_score
+        and box_rectangularity >= cfg.min_box_rectangularity
+        and box_area_ratio >= cfg.min_box_area_ratio
+    )
+
+    # Stronger-looking full cardboard masks may use a slightly smaller area
+    # increase because their color and rectangularity provide extra evidence.
+    strong_box_override = (
+        cfg.box_full_mask_override_enable
+        and package_inside_box >= 0.60
+        and area_growth >= 1.15
+        and box_color_score >= cfg.box_full_mask_strong_color_score
+        and box_rectangularity >= cfg.box_full_mask_strong_rectangularity
+    )
+
+    # A very strong cardboard candidate can also win when it surrounds most
+    # of the smaller package candidate and is clearly more complete.
+    independent_box_override = (
+        cfg.box_full_mask_override_enable
+        and box_color_score >= 0.70
+        and box_rectangularity >= 0.88
+        and box_area >= package_area * 1.45
+        and package_inside_box >= 0.55
+    )
+
+    if (
+        full_box_override
+        or strong_box_override
+        or independent_box_override
+    ):
+        print()
+        print("FULL BOX OVERRIDE APPLIED")
+        print(f"  package mask area:       {package_area}")
+        print(f"  cardboard mask area:     {box_area}")
+        print(f"  box/package area growth: {area_growth:.3f}")
+        print(f"  package inside box:      {package_inside_box:.3f}")
+        print(f"  box inside package:      {box_inside_package:.3f}")
+        print(f"  box color score:         {box_color_score:.3f}")
+        print(f"  box rectangularity:      {box_rectangularity:.3f}")
+
+        best_box["selection_override"] = "full_box_override"
+        best_box["package_inside_box"] = package_inside_box
+        best_box["box_inside_package"] = box_inside_package
+        best_box["box_to_package_area_ratio"] = area_growth
+
+        return best_box, accepted
+
+    # Preserve the original score-based selection when no full-box evidence
+    # is strong enough to justify an override.
+    if best_box["score"] > best_package["score"]:
+        best_box["selection_override"] = "box_score"
+        best_box["package_inside_box"] = package_inside_box
+        best_box["box_inside_package"] = box_inside_package
+        best_box["box_to_package_area_ratio"] = area_growth
+        return best_box, accepted
+
+    best_package["selection_override"] = "package_score"
+    best_package["package_inside_box"] = package_inside_box
+    best_package["box_inside_package"] = box_inside_package
+    best_package["box_to_package_area_ratio"] = area_growth
+    return best_package, accepted
+
+
+def choose_cardboard_box_mask_exact(cfg, masks, box_roi_rgb):
+    """Exact SAM mask-selection path from box_detection_final.py."""
+    h, w = box_roi_rgb.shape[:2]
+    roi_area = h * w
+    roi_cx = w / 2
+    roi_cy = h / 2
+
+    hsv = cv2.cvtColor(box_roi_rgb, cv2.COLOR_RGB2HSV)
+
+    best = None
+
+    for i, m in enumerate(masks):
+        raw_mask = m["segmentation"].astype(np.uint8)
+        mask = clean_box_mask(cfg, raw_mask)
+
+        area = int(mask.sum())
+        area_ratio = area / max(roi_area, 1)
+
+        if area_ratio < cfg.min_box_area_ratio:
+            continue
+
+        if area_ratio > cfg.max_box_area_ratio:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(mask)
+
+        if bw <= 0 or bh <= 0:
+            continue
+
+        rectangularity = area / max(bw * bh, 1)
+        aspect_ratio = max(bw / max(bh, 1), bh / max(bw, 1))
+
+        if rectangularity < cfg.min_box_rectangularity:
+            continue
+
+        if aspect_ratio > cfg.max_box_aspect_ratio:
+            continue
+
+        masked_hsv = hsv[mask == 1]
+
+        if masked_hsv.size == 0:
+            continue
+
+        mean_h = float(np.mean(masked_hsv[:, 0]))
+        mean_s = float(np.mean(masked_hsv[:, 1]))
+        mean_v = float(np.mean(masked_hsv[:, 2]))
+
+        if mean_v < cfg.min_box_value:
+            continue
+
+        hue_score = 1.0 - min(abs(mean_h - 18.0) / 30.0, 1.0)
+        sat_score = 1.0 - min(abs(mean_s - 65.0) / 100.0, 1.0)
+        val_score = 1.0 - min(abs(mean_v - 170.0) / 120.0, 1.0)
+
+        color_score = (
+            0.50 * hue_score
+            + 0.25 * sat_score
+            + 0.25 * val_score
+        )
+
+        if color_score < cfg.min_box_color_score:
+            continue
+
+        center_roi = get_mask_center(mask)
+
+        if center_roi is None:
+            continue
+
+        cx, cy = center_roi
+
+        dist = np.sqrt((cx - roi_cx) ** 2 + (cy - roi_cy) ** 2)
+        max_dist = np.sqrt(roi_cx ** 2 + roi_cy ** 2)
+        center_score = 1.0 - min(dist / max_dist, 1.0)
+
+        area_score = 1.0 - min(
+            abs(area_ratio - cfg.target_box_area_ratio) / cfg.target_box_area_ratio,
+            1.0,
+        )
+
+        sam_iou = float(m.get("predicted_iou", 0.0))
+        sam_stability = float(m.get("stability_score", 0.0))
+
+        score = (
+            2.7 * color_score
+            + 1.6 * rectangularity
+            + 1.2 * area_score
+            + 1.0 * center_score
+            + 0.4 * sam_iou
+            + 0.4 * sam_stability
+        )
+
+        candidate = {
+            "index": i,
+            "score": float(score),
+            "mask": mask,
+            "bbox": (int(x), int(y), int(bw), int(bh)),
+            "center_roi": center_roi,
+            "area": int(area),
+            "area_ratio": float(area_ratio),
+            "rectangularity": float(rectangularity),
+            "aspect_ratio": float(aspect_ratio),
+            "center_score": float(center_score),
+            "area_score": float(area_score),
+            "color_score": float(color_score),
+            "mean_hsv": (mean_h, mean_s, mean_v),
+            "sam_iou": sam_iou,
+            "sam_stability": sam_stability,
+        }
+
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    return best
+
+
+def map_dedicated_box_candidate_to_package_roi(cfg, box_candidate):
+    """Normalize the exact box candidate already produced in the package ROI."""
+    if box_candidate is None:
+        return None
+
+    package_h = cfg.roi_y2 - cfg.roi_y1
+    package_w = cfg.roi_x2 - cfg.roi_x1
+
+    mask = box_candidate["mask"].astype(np.uint8)
+
+    if mask.shape[:2] != (package_h, package_w):
+        print(
+            "Exact box candidate shape does not match the package ROI: "
+            f"candidate={mask.shape[:2]} expected={(package_h, package_w)}"
+        )
+        return None
+
+    area = int(mask.sum())
+
+    if area <= 0:
+        return None
+
+    center_roi = get_mask_center(mask)
+
+    if center_roi is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(mask)
+    rectangularity = area / max(w * h, 1)
+    aspect_ratio = max(w / max(h, 1), h / max(w, 1))
+    package_area = package_h * package_w
+
+    candidate = dict(box_candidate)
+    candidate.update(
+        {
+            "source": "package_roi_exact_box_rules",
+            "selection_override": "package_roi_exact_box_rules",
+            "mask": mask,
+            "safe_mask": mask,
+            "bbox": (int(x), int(y), int(w), int(h)),
+            "center_roi": center_roi,
+            "area": area,
+            "area_ratio": float(area / max(package_area, 1)),
+            "box_roi_area_ratio": float(box_candidate["area_ratio"]),
+            "rectangularity": float(rectangularity),
+            "aspect_ratio": float(aspect_ratio),
+            "bbox_width_ratio": float(w / max(package_w, 1)),
+            "bbox_height_ratio": float(h / max(package_h, 1)),
+            "bbox_size_score": None,
+            "safe_area_ratio": None,
+            "safe_area_score": None,
+            "contrast_score": None,
+            "contrast_value": None,
+            "texture_score": None,
+            "texture_value": None,
+            "rotated": get_rotated_box_from_mask(mask),
+            "exact_box_rules_roi": (
+                cfg.roi_x1,
+                cfg.roi_y1,
+                cfg.roi_x2,
+                cfg.roi_y2,
+            ),
+        }
+    )
+
+    return candidate
+
+
+def choose_best_package_mask(cfg, masks, roi_rgb, dedicated_box_candidate=None):
+    """
+    Keep the complete existing package-ROI selection path, then compare it
+    against the exact box-script candidate made from the same package ROI masks.
+    """
+    package_best, accepted = choose_best_package_mask_from_package_roi(
+        cfg,
+        masks,
+        roi_rgb,
+    )
+
+    if dedicated_box_candidate is None:
+        return package_best, accepted
+
+    accepted.append(dedicated_box_candidate)
+
+    if package_best is None:
+        print("Selected exact-box-rules candidate from the package ROI: no general candidate.")
+        return dedicated_box_candidate, accepted
+
+    package_area = int(package_best["mask"].sum())
+    dedicated_area = int(dedicated_box_candidate["mask"].sum())
+
+    package_inside_dedicated = mask_overlap_fraction(
+        package_best["mask"],
+        dedicated_box_candidate["mask"],
+    )
+
+    dedicated_inside_package = mask_overlap_fraction(
+        dedicated_box_candidate["mask"],
+        package_best["mask"],
+    )
+
+    area_ratio = dedicated_area / max(package_area, 1)
+
+    # Prefer the exact box-script segmentation when it is at least as complete
+    # as the package candidate, or when it clearly contains a smaller half-box
+    # candidate. Do not replace a larger complete package mask with a smaller
+    # dedicated mask.
+    similar_complete_mask = (
+        dedicated_area >= package_area * 0.90
+        and (
+            package_inside_dedicated >= 0.60
+            or dedicated_inside_package >= 0.60
+        )
+    )
+
+    full_box_contains_package = (
+        dedicated_area >= package_area * 1.10
+        and package_inside_dedicated >= 0.50
+    )
+
+    if similar_complete_mask or full_box_contains_package:
+        dedicated_box_candidate["package_inside_dedicated_box"] = (
+            package_inside_dedicated
+        )
+        dedicated_box_candidate["dedicated_box_inside_package"] = (
+            dedicated_inside_package
+        )
+        dedicated_box_candidate["dedicated_to_package_area_ratio"] = area_ratio
+
+        print()
+        print("EXACT BOX RULES SELECTED FROM PACKAGE ROI")
+        print(f"  package mask area:              {package_area}")
+        print(f"  exact box mask area:        {dedicated_area}")
+        print(f"  exact/package area ratio:   {area_ratio:.3f}")
+        print(f"  package inside exact box:   {package_inside_dedicated:.3f}")
+        print(f"  exact box inside package:   {dedicated_inside_package:.3f}")
+        print(f"  exact box color score:      {dedicated_box_candidate['color_score']:.3f}")
+        print(f"  exact box rectangularity:   {dedicated_box_candidate['rectangularity']:.3f}")
+
+        return dedicated_box_candidate, accepted
+
+    print()
+    print("Exact-box-rules candidate was smaller or inconsistent.")
+    print("Keeping the package-ROI selection.")
+    print(f"  package mask area:              {package_area}")
+    print(f"  exact box mask area:        {dedicated_area}")
+    print(f"  exact/package area ratio:   {area_ratio:.3f}")
+    print(f"  package inside exact box:   {package_inside_dedicated:.3f}")
+    print(f"  exact box inside package:   {dedicated_inside_package:.3f}")
+
+    return package_best, accepted
 
 
 def robust_depth_values(cfg, values):
@@ -976,7 +1600,7 @@ def count_polymailer_depth_signals(poly_signature):
     return int(signals)
 
 
-def classify_package_type(cfg, depth_roi, package_mask, info):
+def classify_package_type(cfg, depth_roi, package_mask, info, package_depth_mm=None):
     depth_features = fit_plane_depth_features(cfg, depth_roi, package_mask)
     poly_signature = compute_polymailer_depth_signature(cfg, depth_roi, package_mask)
 
@@ -1099,9 +1723,160 @@ def classify_package_type(cfg, depth_roi, package_mask, info):
 
         confidence = float(np.clip(confidence, 0.0, 1.0))
 
+    segmentation_box_override = False
+    segmentation_box_override_reason = None
+    segmentation_box_override_vetoed = False
+    segmentation_box_override_veto_reason = None
+
+    # Preserve the depth classifier result before any RGB segmentation
+    # override is considered. This is needed because brown polymailers can
+    # pass the same HSV and rectangularity rules as cardboard boxes.
+    depth_classifier_type = package_type
+    depth_classifier_confidence = float(confidence)
+
+    selected_source = info.get("source")
+    selected_score = float(info.get("score", 0.0) or 0.0)
+    selected_color_score = float(info.get("color_score", 0.0) or 0.0)
+    selected_rectangularity = float(
+        info.get("rectangularity", rectangularity) or 0.0
+    )
+    selected_area_ratio = float(info.get("area_ratio", mask_area_ratio) or 0.0)
+
+    merged_box_source = selected_source == "cardboard_box_merged_masks"
+
+    strong_exact_box_source = (
+        selected_source == "package_roi_exact_box_rules"
+        and selected_score >= cfg.box_type_segmentation_min_score
+        and selected_color_score >= cfg.box_type_segmentation_min_color_score
+        and selected_rectangularity >= cfg.box_type_segmentation_min_rectangularity
+        and selected_area_ratio >= cfg.box_type_segmentation_min_area_ratio
+    )
+
+    poly_score = float(poly_signature.get("score", 0.0) or 0.0)
+
+    package_depth_value = (
+        float(package_depth_mm)
+        if package_depth_mm is not None
+        else None
+    )
+
+    # Primary rule:
+    # If the depth classifier says polymailer and the package is physically
+    # thin, do not let the brown-cardboard RGB override change it to box.
+    depth_classified_thin_polymailer = (
+        package_depth_value is not None
+        and depth_classifier_type == "polymailer"
+        and package_depth_value <= cfg.box_type_polymailer_veto_max_package_depth_mm
+    )
+
+    # Secondary hard rule:
+    # Very thin packages with a meaningful polymailer signature are also
+    # protected even if the base depth classifier happens to flicker to box.
+    hard_thin_polymailer = (
+        package_depth_value is not None
+        and package_depth_value <= cfg.box_type_polymailer_hard_thin_max_depth_mm
+        and (
+            poly_score >= cfg.box_type_polymailer_hard_thin_min_poly_score
+            or poly_signal_count >= cfg.box_type_polymailer_veto_min_signal_count
+        )
+    )
+
+    # Medium-thickness fallback. This still requires stronger polymailer
+    # evidence, but uses OR instead of requiring both signals simultaneously.
+    thin_with_supporting_poly_evidence = (
+        package_depth_value is not None
+        and package_depth_value <= cfg.box_type_polymailer_veto_max_package_depth_mm
+        and (
+            poly_score >= cfg.box_type_polymailer_veto_min_poly_score
+            or poly_signal_count >= cfg.box_type_polymailer_veto_min_signal_count
+        )
+    )
+
+    strong_thin_polymailer_veto = (
+        cfg.box_type_polymailer_veto_enable
+        and (
+            depth_classified_thin_polymailer
+            or hard_thin_polymailer
+            or thin_with_supporting_poly_evidence
+        )
+    )
+
+    if strong_thin_polymailer_veto:
+        segmentation_box_override_vetoed = True
+        segmentation_box_override_veto_reason = "strong_thin_polymailer_depth"
+
+        print()
+        print("SEGMENTATION BOX TYPE OVERRIDE VETOED")
+        print(f"  source:              {selected_source}")
+        print(f"  depth type:          {depth_classifier_type}")
+        print(f"  depth confidence:    {depth_classifier_confidence:.3f}")
+        print(f"  poly score:          {poly_score:.3f}")
+        print(f"  poly signal count:   {poly_signal_count}")
+        print(f"  package depth mm:    {package_depth_value:.3f}")
+        print(f"  depth-thin rule:     {depth_classified_thin_polymailer}")
+        print(f"  hard-thin rule:      {hard_thin_polymailer}")
+        print(f"  supported-thin rule: {thin_with_supporting_poly_evidence}")
+        print("  final type remains:  polymailer")
+
+    # Depth can look polymailer-like on a cardboard box because the center seam,
+    # tape, labels, and stereo holes create a strong center/edge depth signature.
+    # A complete mask selected by the exact box rules is stronger type evidence,
+    # except when the strong thin-polymailer veto above is active.
+    if (
+        cfg.box_type_segmentation_override_enable
+        and not strong_thin_polymailer_veto
+        and selected_source in BOX_TYPE_SEGMENTATION_OVERRIDE_SOURCES
+        and (merged_box_source or strong_exact_box_source)
+    ):
+        package_type = "box"
+
+        segmentation_confidence = (
+            0.55
+            + 0.25 * selected_color_score
+            + 0.20 * selected_rectangularity
+        )
+        confidence = float(
+            np.clip(
+                max(
+                    cfg.box_type_segmentation_min_confidence,
+                    segmentation_confidence,
+                ),
+                0.0,
+                0.97,
+            )
+        )
+
+        segmentation_box_override = True
+        segmentation_box_override_reason = (
+            "merged_cardboard_fragments"
+            if merged_box_source
+            else "strong_exact_box_rules"
+        )
+
+        print()
+        print("SEGMENTATION BOX TYPE OVERRIDE APPLIED")
+        print(f"  source:          {selected_source}")
+        print(f"  reason:          {segmentation_box_override_reason}")
+        print(f"  mask score:      {selected_score:.3f}")
+        print(f"  color score:     {selected_color_score:.3f}")
+        print(f"  rectangularity:  {selected_rectangularity:.3f}")
+        print(f"  area ratio:      {selected_area_ratio:.3f}")
+        print(f"  final confidence:{confidence:.3f}")
+
     return {
         "package_type": package_type,
         "package_type_confidence": float(confidence),
+        "segmentation_box_override": segmentation_box_override,
+        "segmentation_box_override_reason": segmentation_box_override_reason,
+        "segmentation_box_override_vetoed": segmentation_box_override_vetoed,
+        "segmentation_box_override_veto_reason": segmentation_box_override_veto_reason,
+        "depth_classifier_type_before_override": depth_classifier_type,
+        "depth_classifier_confidence_before_override": depth_classifier_confidence,
+        "package_depth_mm_for_type": (
+            float(package_depth_mm)
+            if package_depth_mm is not None
+            else None
+        ),
         "box_score": float(box_score),
         "raw_box_score": float(raw_box_score),
         "flatness_score": float(flatness_score),
@@ -1307,26 +2082,61 @@ def run_sam_package_depth_type(
     depth_class_roi = depth_class_aligned[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2].copy()
     depth_measure_roi = depth_measure_aligned[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2].copy()
 
-    print("Running SAM 2 package segmentation on ROI...")
+    print("Running SAM 2 package segmentation on main ROI...")
 
     with torch.inference_mode():
         masks = mask_generator.generate(roi_rgb)
 
-    print(f"Generated {len(masks)} masks inside ROI")
+    print(f"Generated {len(masks)} masks inside main package ROI")
 
-    best, accepted = choose_best_package_mask(cfg, masks, roi_rgb)
+    dedicated_box_candidate = None
+    dedicated_box_mask_count = 0
+
+    if cfg.dedicated_box_sam_enable:
+        print(
+            "Applying exact box-script mask-selection rules to the SAME "
+            "package ROI masks..."
+        )
+
+        # Reuse the masks generated from the package ROI. This does not run a
+        # second ROI and does not change the package detector search area.
+        dedicated_box_mask_count = len(masks)
+
+        dedicated_box_local = choose_cardboard_box_mask_exact(
+            cfg,
+            masks,
+            roi_rgb,
+        )
+
+        dedicated_box_candidate = map_dedicated_box_candidate_to_package_roi(
+            cfg,
+            dedicated_box_local,
+        )
+
+        if dedicated_box_candidate is None:
+            print("No valid exact-box-rules candidate found in package ROI.")
+        else:
+            print(
+                "Exact-box-rules candidate found in package ROI: "
+                f"score={dedicated_box_candidate['score']:.3f}, "
+                f"area={dedicated_box_candidate['area_ratio']:.3f}, "
+                f"rect={dedicated_box_candidate['rectangularity']:.3f}, "
+                f"color={dedicated_box_candidate['color_score']:.3f}"
+            )
+
+    best, accepted = choose_best_package_mask(
+        cfg,
+        masks,
+        roi_rgb,
+        dedicated_box_candidate,
+    )
 
     if best is None:
         print("No valid package/product or cardboard box mask found.")
         return None
 
-    classification = classify_package_type(
-        cfg,
-        depth_roi=depth_class_roi,
-        package_mask=best["mask"],
-        info=best,
-    )
-
+    # Measure the top face first so the box-type override can use physical
+    # package thickness as a veto for strong, thin polymailers.
     top_face_depth_result = package_face_depth_mm(
         cfg,
         depth_measure_roi,
@@ -1339,6 +2149,14 @@ def run_sam_package_depth_type(
         max(0.0, cfg.base_depth_mm - top_face_depth_mm)
         if top_face_depth_mm is not None
         else None
+    )
+
+    classification = classify_package_type(
+        cfg,
+        depth_roi=depth_class_roi,
+        package_mask=best["mask"],
+        info=best,
+        package_depth_mm=package_depth_mm,
     )
 
     cx_full = cfg.roi_x1 + best["center_roi"][0]
@@ -1446,6 +2264,8 @@ def run_sam_package_depth_type(
         "info": best,
         "accepted": accepted,
         "all_mask_count": len(masks),
+        "dedicated_box_mask_count": dedicated_box_mask_count,
+        "dedicated_box_candidate_found": dedicated_box_candidate is not None,
         "top_face_depth_mm": top_face_depth_mm,
         "package_depth_mm": package_depth_mm,
         "top_face_depth_result": top_face_depth_result,

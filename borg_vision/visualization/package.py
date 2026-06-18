@@ -226,10 +226,16 @@ def save_accepted_masks(save_dir, timestamp, result):
     accepted_dir = save_dir / f"accepted_masks_{timestamp}"
     accepted_dir.mkdir(exist_ok=True)
 
-    for item in result["accepted"]:
-        idx = item["index"]
-        source = item["source"]
-        path = accepted_dir / f"accepted_mask_{idx:03d}_{source}_score_{item['score']:.3f}.png"
+    for item_number, item in enumerate(result["accepted"]):
+        idx = item.get("index")
+        source = item.get("source", "unknown")
+
+        if idx is None:
+            idx_text = f"merged_{item_number:03d}"
+        else:
+            idx_text = f"{int(idx):03d}"
+
+        path = accepted_dir / f"accepted_mask_{idx_text}_{source}_score_{item['score']:.3f}.png"
         save_binary_mask(path, item["mask"])
 
 
@@ -255,12 +261,23 @@ def make_json_result(cfg, result, timestamp):
         "package_type": final_output["package_type"],
         "package_type_confidence_percent": json_number(final_output["package_type_confidence_percent"]),
         "mask_source": final_output["mask_source"],
-        "selected_mask_index": int(info["index"]),
+        "selected_mask_index": (
+            int(info["index"])
+            if info.get("index") is not None
+            else None
+        ),
+        "selected_mask_merged_from_indices": info.get("merged_from_indices"),
         "selected_mask_score": json_number(info["score"]),
         "selected_mask_area_ratio": json_number(info["area_ratio"]),
         "selected_mask_rectangularity": json_number(info["rectangularity"]),
         "selected_mask_aspect_ratio": json_number(info["aspect_ratio"]),
         "selected_mask_color_score": json_number(info["color_score"]),
+        "selected_mask_selection_override": info.get("selection_override"),
+        "dedicated_box_sam_enabled": bool(cfg.dedicated_box_sam_enable),
+        "dedicated_box_mask_count": int(result.get("dedicated_box_mask_count", 0)),
+        "dedicated_box_candidate_found": bool(
+            result.get("dedicated_box_candidate_found", False)
+        ),
         "top_face_depth_mm": json_number(final_output["top_face_depth_mm"]),
         "package_depth_mm": json_number(final_output["package_depth_mm"]),
         "length_mm": json_number(final_output["length_mm"]),
@@ -291,6 +308,27 @@ def make_json_result(cfg, result, timestamp):
             "min_depth_mm": json_number(result["top_face_depth_result"]["min_depth_mm"]),
         },
         "depth_classification_debug": {
+            "segmentation_box_override": bool(
+                classification.get("segmentation_box_override", False)
+            ),
+            "segmentation_box_override_reason": classification.get(
+                "segmentation_box_override_reason"
+            ),
+            "segmentation_box_override_vetoed": bool(
+                classification.get("segmentation_box_override_vetoed", False)
+            ),
+            "segmentation_box_override_veto_reason": classification.get(
+                "segmentation_box_override_veto_reason"
+            ),
+            "depth_classifier_type_before_override": classification.get(
+                "depth_classifier_type_before_override"
+            ),
+            "depth_classifier_confidence_before_override": json_number(
+                classification.get("depth_classifier_confidence_before_override")
+            ),
+            "package_depth_mm_for_type": json_number(
+                classification.get("package_depth_mm_for_type")
+            ),
             "box_score": json_number(classification["box_score"]),
             "raw_box_score": json_number(classification["raw_box_score"]),
             "poly_signal_count": int(classification["poly_signal_count"]),
