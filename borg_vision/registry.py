@@ -56,11 +56,16 @@ def config_class_for(mode):
     return MODES[resolve_mode(mode)][1]
 
 
-def get_detector(mode, cfg=None, mxid=None, torch_device=None):
+def get_detector(mode, cfg=None, mxid=None, torch_device=None, camera=None):
     """Build a detector for `mode`.
 
     cfg may be None (use the mode's default config), a config instance, or a
     path to a YAML file of overrides for the mode's config class.
+
+    `camera` optionally injects a pre-built, caller-owned OakCamera so several
+    detectors can share one physical device (multi-mode-per-camera). When given,
+    `mxid` is ignored (the shared camera already owns the device) and the
+    detector will not open/close it.
     """
     detector_class, config_class = MODES[resolve_mode(mode)]
 
@@ -69,4 +74,4 @@ def get_detector(mode, cfg=None, mxid=None, torch_device=None):
     elif isinstance(cfg, str):
         cfg = config_class.from_yaml(cfg)
 
-    return detector_class(cfg, mxid=mxid, torch_device=torch_device)
+    return detector_class(cfg, mxid=mxid, torch_device=torch_device, camera=camera)

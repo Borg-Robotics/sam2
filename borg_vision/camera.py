@@ -106,9 +106,16 @@ def get_rgb_intrinsics(cfg, device):
 
 
 class OakCamera:
-    def __init__(self, cfg, mxid=None):
+    def __init__(self, cfg, mxid=None, needs_measurement_stereo=None):
         self.cfg = cfg
         self.mxid = mxid
+
+        # When a camera is shared across several modes (multi-mode-per-camera),
+        # the pipeline must build the measurement-stereo stream if *any*
+        # co-located mode needs it, regardless of which mode's cfg was used to
+        # construct this camera. `needs_measurement_stereo=None` falls back to
+        # cfg.needs_measurement_stereo (single-mode behaviour).
+        self._needs_measurement_stereo = needs_measurement_stereo
 
         self._pipeline = None
         self._device = None
@@ -179,7 +186,11 @@ class OakCamera:
         # (package, box) build a second StereoDepth node. Modes that reuse the
         # classification depth for measurement (object, clear_bag, polymailer)
         # skip it, and get_frames() falls back to the classification depth.
-        if cfg.needs_measurement_stereo:
+        needs_measurement_stereo = self._needs_measurement_stereo
+        if needs_measurement_stereo is None:
+            needs_measurement_stereo = cfg.needs_measurement_stereo
+
+        if needs_measurement_stereo:
             left_measure_out = left.requestOutput(
                 size=cfg.stereo_size,
                 type=dai.ImgFrame.Type.GRAY8,

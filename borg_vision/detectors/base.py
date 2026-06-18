@@ -38,9 +38,19 @@ class BaseDetector:
     #: Whether detection is gated on first decoding a barcode.
     requires_barcode = False
 
-    def __init__(self, cfg=None, mxid=None, torch_device=None):
+    def __init__(self, cfg=None, mxid=None, torch_device=None, camera=None):
         self.cfg = cfg if cfg is not None else self.config_class()
-        self.camera = OakCamera(self.cfg, mxid=mxid)
+
+        # When `camera` is provided (multi-mode-per-camera setups), several
+        # detectors share one OAK-D device. The shared camera is owned by the
+        # caller, so this detector must NOT open or close it -- open()/close()
+        # become no-ops and the owner manages the device lifecycle once.
+        if camera is not None:
+            self.camera = camera
+            self._owns_camera = False
+        else:
+            self.camera = OakCamera(self.cfg, mxid=mxid)
+            self._owns_camera = True
 
         self._torch_device = torch_device
         self._mask_generator = None
@@ -76,11 +86,15 @@ class BaseDetector:
         )
 
     def open(self):
-        self.camera.open()
+        # No-op for a shared camera; the owner opens it once.
+        if self._owns_camera:
+            self.camera.open()
         return self
 
     def close(self):
-        self.camera.close()
+        # No-op for a shared camera; the owner closes it once.
+        if self._owns_camera:
+            self.camera.close()
 
     def warmup(self, seconds=None, should_abort=None):
         """Pump frames for the configured warmup period. Returns False if aborted."""
