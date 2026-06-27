@@ -21,22 +21,29 @@ One camera/station = one mode. Pick a mode with `get_detector(mode)`.
 | `object` | Generic single object + center depth | no | center pixel, `distance_mm` |
 | `polymailer` | Polymailer + product bulge inside | no | dims, center, product-inside |
 | `clear_bag` | Visible product + transparent bag around it | no | bag dims, center, product center |
+| `inspection` | Return-condition verdict from **two** cameras + OpenAI | no | `result` (good/damaged/manual_review), `confidence` |
 
 `product` is accepted as an alias of `package`.
+
+`inspection` is the odd one out — see [Inspection mode](#inspection-mode-dual-camera--openai).
 
 ## Layout
 
 ```
 borg_vision/
-  config/        BaseConfig + per-mode configs (PackageConfig, BoxConfig, ...)
+  config/        BaseConfig + per-mode configs (PackageConfig, BoxConfig, ...,
+                 InspectionConfig — standalone, no SAM2/depth fields)
   camera.py      OakCamera + Frames (depthai v3 pipeline, depth->RGB alignment)
   barcode.py     pyzbar barcode detection + overlay
+  inspection.py  OpenAI inspection logic (prompt, image optimize, API call)
   detection/     per-mode pure detection logic (run_sam2_* entry points)
   visualization/ common.py + per-mode overlays/heatmaps/JSON
-  results.py     BaseResult + per-mode result dataclasses
-  detectors/     BaseDetector + per-mode detectors
-  registry.py    get_detector(mode, ...) factory + available_modes()
+  results.py     BaseResult + per-mode result dataclasses (+ InspectionResult)
+  detectors/     BaseDetector + per-mode detectors (+ InspectionDetector)
+  registry.py    get_detector(mode, ...) factory + get_inspection_detector()
+                 + available_modes()
   cli/           run.py (generic runner) + product_detection.py (interactive)
+                 + inspection.py (dual-camera / offline inspection runner)
   __main__.py    `python -m borg_vision`
 ```
 
@@ -47,6 +54,7 @@ importable as aliases of the `Package*` classes for backwards compatibility.
 
 ```bash
 pip install -e ".[borg]"   # depthai, pyzbar, opencv, PyYAML on top of sam2
+                            # (+ requests, Pillow for the inspection mode)
 # checkpoint: checkpoints/download_ckpts.sh  (sam2.1_hiera_small.pt)
 ```
 
@@ -141,6 +149,71 @@ SPACE/q barcode-gated preview loop:
 python -m borg_vision.cli.product_detection
 ```
 
+## Inspection mode (dual-camera + OpenAI)
+
+`inspection` does not fit the single-camera SAM2 pattern above. It captures
+several photos of a product from **two** OAK-D cameras and sends them together
+to an OpenAI vision model, which returns a return-condition verdict:
+
+| `result` | meaning |
+|---|---|
+| `good` | no meaningful visible damage |
+| `damaged` | clear serious visible damage |
+| `manual_review` | unclear, product missing/uncertain, or not enough visible info |
+
+Because of this it is **not** built on `BaseDetector` (no SAM2, no stereo depth,
+no barcode, no TF) and has its own factory and config:
+
+```python
+from borg_vision import get_inspection_detector
+
+# Two devices selected by mxid (both None = first two available).
+detector = get_inspection_detector(cfg=None, mxid_1=None, mxid_2=None)
+
+with detector:                              # opens BOTH OAK-D devices
+    result = detector.inspect("Label Maker")   # capture N frames + call OpenAI
+    if result is not None:                  # None only if aborted mid-capture
+        print(result.result, result.confidence, result.summary)
+        detector.save_debug(result)         # writes inspection_result.json
+```
+
+`inspect(product_name, count=None, should_abort=None, on_stage=None)` captures
+`cfg.capture_count` frames (alternating cameras, headless — no preview window),
+saves them as JPEGs under `cfg.save_dir/<request_id>/`, then runs one OpenAI
+request over all of them. `should_abort` is polled once per captured frame for
+ROS goal cancellation; `on_stage("capturing"|"inspecting")` reports progress.
+
+Key `InspectionConfig` fields (RGB capture + OpenAI request only):
+
+| Field | Default | Purpose |
+|---|---|---|
+| `capture_count` | 4 | frames to capture before inspecting |
+| `rgb_size` | (1280, 720) | per-camera capture resolution |
+| `startup_delay_seconds` | 2.0 | wait between opening camera 1 and 2 (USB stability) |
+| `model` | `gpt-5.5` | OpenAI model (or `OPENAI_MODEL` env) |
+| `max_size` / `quality` | 1600 / 72 | optimized image size/JPEG quality sent to the API |
+| `timeout_s` | 180.0 | OpenAI request timeout |
+
+The OpenAI API key is read from **`OPENAI_API_KEY`** in the environment only —
+never from config. `requests` and `Pillow` are required (installed by the
+`[borg]` extra / present in the borg-vision container).
+
+### Inspection CLI
+
+```bash
+# Offline: inspect existing images (no cameras) — verifies the OpenAI path.
+export OPENAI_API_KEY=sk-...
+python -m borg_vision.cli.inspection --product-name "Label Maker" \
+    --images test-images/IMG_0563.jpg test-images/IMG_0564.jpg
+
+# Live: capture from two OAK-D cameras, then inspect.
+python -m borg_vision.cli.inspection --product-name "Label Maker" \
+    --capture --capture-count 4 --mxid-1 14442C... --mxid-2 14442C...
+```
+
+`get_detector("inspection")` raises with a redirect — always use
+`get_inspection_detector()` (or the CLI) for the dual-camera mode.
+
 ## Saved artifacts
 
 `save_debug(result)` writes a uniform set per mode under the mode's `save_dir`
@@ -159,14 +232,25 @@ The annotated `*.png` is a side-by-side of RGB + depth (+ heatmap for modes
 that produce one). `draw_result(result)` returns the same image in memory
 without writing to disk.
 
+`inspection` differs: the captured JPEGs (and their optimized copies) already
+live under `cfg.save_dir/<request_id>/camera_{1,2}/`; `save_debug(result)` adds
+`inspection_result.json` (the verdict, confidence, reasons, image paths). There
+is no annotated overlay or `draw_result`.
+
 ## Units and frames
 
 Library results are in **millimeters / degrees**, in the camera optical frame
 (x right, y down, z forward) — the ROS2 layer converts to meters/radians and
 transforms into the requested frame. JSON files mirror the original scripts'
-schemas exactly.
+schemas exactly. (The `inspection` mode is the exception: it has no geometric
+output — only the verdict `result` + `confidence`.)
 
 ## Adding a new mode
+
+> This recipe is for **SAM2 single-camera** modes. The `inspection` mode is a
+> different shape — a standalone `InspectionDetector` (two cameras, OpenAI, no
+> `BaseDetector`) built via `get_inspection_detector()` — so it does not follow
+> these steps.
 
 Each mode is a mechanical port of one `run_X()` in
 `unified_detector_all_in_one.py`:
