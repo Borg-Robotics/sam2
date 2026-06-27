@@ -9,7 +9,7 @@ backwards-compatible alias so existing consumers keep importing it unchanged.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from .camera import Frames
 
@@ -164,6 +164,59 @@ class ClearBagResult(BaseResult):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return make_json_result(cfg, self.raw, timestamp)
+
+
+@dataclass
+class InspectionResult:
+    """Product-inspection verdict from the OpenAI vision model.
+
+    Unlike the segmentation results above, inspection has no raw detection dict
+    or Frames -- it carries the captured/optimized image paths and the verdict.
+    """
+
+    result: str = ""                                # "good" | "damaged" | "manual_review"
+    confidence: float = 0.0                         # 0.0 - 1.0
+    summary: str = ""
+    reasons: List[str] = field(default_factory=list)
+    observed_defects: List[str] = field(default_factory=list)
+    product_name: str = ""
+    request_id: str = ""
+    image_paths: List[str] = field(default_factory=list)         # captured originals
+    optimized_image_paths: List[str] = field(default_factory=list)
+    usage: Optional[dict] = field(default=None, repr=False)
+    raw_response_id: Optional[str] = None
+
+    @classmethod
+    def from_run(cls, run, product_name, request_id, image_paths):
+        """Build from the dict returned by inspection.run_inspection."""
+        return cls(
+            result=run["result"],
+            confidence=run["confidence"],
+            summary=run["summary"],
+            reasons=run["reasons"],
+            observed_defects=run["observed_defects"],
+            product_name=product_name,
+            request_id=request_id,
+            image_paths=[str(p) for p in image_paths],
+            optimized_image_paths=run["optimized_image_paths"],
+            usage=run["usage"],
+            raw_response_id=run["raw_response_id"],
+        )
+
+    def to_json_dict(self):
+        return {
+            "request_id": self.request_id,
+            "product_name": self.product_name,
+            "result": self.result,
+            "confidence": self.confidence,
+            "summary": self.summary,
+            "reasons": list(self.reasons),
+            "observed_defects": list(self.observed_defects),
+            "image_paths": list(self.image_paths),
+            "optimized_image_paths": list(self.optimized_image_paths),
+            "usage": self.usage,
+            "raw_response_id": self.raw_response_id,
+        }
 
 
 # Backwards-compatible alias for the pre-refactor single-mode result name.

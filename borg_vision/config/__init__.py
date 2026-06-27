@@ -9,6 +9,7 @@ product_detection CLI) keep importing it unchanged.
 from .base import BaseConfig
 from .box import BoxConfig
 from .clear_bag import ClearBagConfig
+from .inspection import InspectionConfig
 from .object import ObjectConfig
 from .package import PackageConfig
 from .polymailer import PolymailerConfig
@@ -23,5 +24,6 @@ __all__ = [
     "BoxConfig",
     "PolymailerConfig",
     "ClearBagConfig",
+    "InspectionConfig",
     "ProductDetectionConfig",
 ]

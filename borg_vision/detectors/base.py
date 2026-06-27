@@ -32,6 +32,19 @@ from ..camera import OakCamera
 from ..config import BaseConfig
 
 
+def artifact_name(stem, ext, timestamp, organized):
+    """Build a debug-artifact filename.
+
+    When ``organized`` is True the caller saves into a per-detection folder that
+    already encodes the timestamp (``<camera>/<mode>/<timestamp>/``), so the
+    per-file timestamp suffix is dropped for clean names (``raw_rgb.jpg``).
+    Otherwise the legacy flat naming (``raw_rgb_<timestamp>.jpg``) is kept.
+    """
+    if organized:
+        return f"{stem}.{ext}"
+    return f"{stem}_{timestamp}.{ext}"
+
+
 class BaseDetector:
     #: Default config class for the mode; subclasses override.
     config_class = BaseConfig
@@ -211,14 +224,15 @@ class BaseDetector:
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        save_dir = Path(out_dir) if out_dir is not None else Path(cfg.save_dir)
+        organized = out_dir is not None
+        save_dir = Path(out_dir) if organized else Path(cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         result_bgr = self._draw_result(result)
 
-        raw_path = save_dir / f"raw_rgb_{timestamp}.jpg"
-        result_path = save_dir / f"{mode}_final_{timestamp}.png"
-        json_path = save_dir / f"{mode}_final_{timestamp}.json"
+        raw_path = save_dir / artifact_name("raw_rgb", "jpg", timestamp, organized)
+        result_path = save_dir / artifact_name(f"{mode}_final", "png", timestamp, organized)
+        json_path = save_dir / artifact_name(f"{mode}_final", "json", timestamp, organized)
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
         cv2.imwrite(str(result_path), result_bgr)
@@ -233,7 +247,7 @@ class BaseDetector:
         from ..visualization import save_binary_mask
 
         for key, value in self._debug_artifacts(result).items():
-            path = save_dir / f"{key}_{timestamp}.png"
+            path = save_dir / artifact_name(key, "png", timestamp, organized)
             if getattr(value, "dtype", None) is not None and value.ndim == 2:
                 save_binary_mask(path, value)
             else:

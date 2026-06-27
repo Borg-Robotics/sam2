@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import torch
 
-from ..utils import fmt3, score_from_bad_good, score_from_range
+from ..utils import _long_axis_angle_deg, fmt3, score_from_bad_good, score_from_range
 from ..visualization import make_package_depth_heatmap
 
 
@@ -195,7 +195,7 @@ def get_rotated_box_from_mask(mask):
         "center_roi": (float(cx), float(cy)),
         "width_px": float(w_px),
         "height_px": float(h_px),
-        "angle_deg": float(angle),
+        "angle_deg": _long_axis_angle_deg(w_px, h_px, angle),
         "points_roi": box_points,
     }
 

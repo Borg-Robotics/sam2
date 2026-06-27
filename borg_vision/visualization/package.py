@@ -222,8 +222,10 @@ def draw_result(cfg, frame_bgr, depth_class_aligned, result):
     return cv2.cvtColor(combined_rgb, cv2.COLOR_RGB2BGR)
 
 
-def save_accepted_masks(save_dir, timestamp, result):
-    accepted_dir = save_dir / f"accepted_masks_{timestamp}"
+def save_accepted_masks(save_dir, timestamp, result, organized=False):
+    # When organized, save_dir is already a per-detection folder, so drop the
+    # timestamp from the subfolder name.
+    accepted_dir = save_dir / ("accepted_masks" if organized else f"accepted_masks_{timestamp}")
     accepted_dir.mkdir(exist_ok=True)
 
     for item_number, item in enumerate(result["accepted"]):

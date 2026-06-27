@@ -11,6 +11,10 @@ the camera, warm up, run one detection and save the debug artifacts
 For the package mode's original interactive SPACE/q barcode-gated loop, use:
 
     python -m borg_vision.cli.product_detection
+
+The dual-camera "inspection" mode does not fit this single-camera runner; use:
+
+    python -m borg_vision.cli.inspection --product-name "..." --capture
 """
 
 import argparse

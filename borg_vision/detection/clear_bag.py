@@ -13,7 +13,7 @@ import numpy as np
 
 import torch
 
-from ..utils import score_from_bad_good
+from ..utils import _long_axis_angle_deg, score_from_bad_good
 from ..visualization.clear_bag import make_clear_bag_depth_heatmap
 from .package import (
     close_mask,
@@ -508,7 +508,7 @@ def get_rotated_rect_from_mask(mask):
         "center_roi": (float(cx), float(cy)),
         "width_px": float(w_px),
         "height_px": float(h_px),
-        "angle_deg": float(angle),
+        "angle_deg": _long_axis_angle_deg(w_px, h_px, angle),
         "points_roi": box_points,
     }
 

@@ -22,7 +22,7 @@ from ..visualization import (
     save_accepted_masks,
     save_binary_mask,
 )
-from .base import BaseDetector
+from .base import BaseDetector, artifact_name
 
 
 class PackageDetector(BaseDetector):
@@ -76,17 +76,18 @@ class PackageDetector(BaseDetector):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        save_dir = Path(out_dir) if out_dir is not None else Path(cfg.save_dir)
+        organized = out_dir is not None
+        save_dir = Path(out_dir) if organized else Path(cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         result_bgr = self._draw_result(result)
 
-        raw_path = save_dir / f"raw_rgb_{timestamp}.jpg"
-        result_path = save_dir / f"package_final_{timestamp}.png"
-        mask_path = save_dir / f"package_mask_{timestamp}.png"
-        product_mask_path = save_dir / f"product_inside_mask_{timestamp}.png"
-        heatmap_path = save_dir / f"package_depth_heatmap_{timestamp}.png"
-        json_path = save_dir / f"package_final_{timestamp}.json"
+        raw_path = save_dir / artifact_name("raw_rgb", "jpg", timestamp, organized)
+        result_path = save_dir / artifact_name("package_final", "png", timestamp, organized)
+        mask_path = save_dir / artifact_name("package_mask", "png", timestamp, organized)
+        product_mask_path = save_dir / artifact_name("product_inside_mask", "png", timestamp, organized)
+        heatmap_path = save_dir / artifact_name("package_depth_heatmap", "png", timestamp, organized)
+        json_path = save_dir / artifact_name("package_final", "json", timestamp, organized)
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
         cv2.imwrite(str(result_path), result_bgr)
@@ -95,7 +96,7 @@ class PackageDetector(BaseDetector):
         cv2.imwrite(str(heatmap_path), result.raw["depth_heatmap"])
 
         if cfg.debug_save_all_accepted_masks:
-            save_accepted_masks(save_dir, timestamp, result.raw)
+            save_accepted_masks(save_dir, timestamp, result.raw, organized)
 
         with open(json_path, "w") as f:
             json.dump(make_json_result(cfg, result.raw, timestamp), f, indent=2)

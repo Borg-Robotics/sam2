@@ -20,7 +20,7 @@ from ..detection.box import run_sam2_cardboard_box
 from ..results import BoxResult
 from ..visualization import save_binary_mask
 from ..visualization.box import draw_result, make_json_result
-from .base import BaseDetector
+from .base import BaseDetector, artifact_name
 
 
 class BoxDetector(BaseDetector):
@@ -74,15 +74,16 @@ class BoxDetector(BaseDetector):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        save_dir = Path(out_dir) if out_dir is not None else Path(cfg.save_dir)
+        organized = out_dir is not None
+        save_dir = Path(out_dir) if organized else Path(cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         result_bgr = self._draw_result(result)
 
-        raw_path = save_dir / f"raw_rgb_{timestamp}.jpg"
-        result_path = save_dir / f"cardboard_box_measurements_{timestamp}.png"
-        mask_path = save_dir / f"cardboard_box_mask_{timestamp}.png"
-        json_path = save_dir / f"cardboard_box_measurements_{timestamp}.json"
+        raw_path = save_dir / artifact_name("raw_rgb", "jpg", timestamp, organized)
+        result_path = save_dir / artifact_name("cardboard_box_measurements", "png", timestamp, organized)
+        mask_path = save_dir / artifact_name("cardboard_box_mask", "png", timestamp, organized)
+        json_path = save_dir / artifact_name("cardboard_box_measurements", "json", timestamp, organized)
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
         cv2.imwrite(str(result_path), result_bgr)

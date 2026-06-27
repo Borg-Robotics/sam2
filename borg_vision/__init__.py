@@ -17,6 +17,7 @@ from .config import (
     BaseConfig,
     BoxConfig,
     ClearBagConfig,
+    InspectionConfig,
     ObjectConfig,
     PackageConfig,
     PolymailerConfig,
@@ -26,6 +27,7 @@ from .detectors import (
     BaseDetector,
     BoxDetector,
     ClearBagDetector,
+    InspectionDetector,
     ObjectDetector,
     PackageDetector,
     PolymailerDetector,
@@ -35,12 +37,14 @@ from .registry import (
     available_modes,
     config_class_for,
     get_detector,
+    get_inspection_detector,
     resolve_mode,
 )
 from .results import (
     BaseResult,
     BoxResult,
     ClearBagResult,
+    InspectionResult,
     ObjectResult,
     PackageResult,
     PolymailerResult,
@@ -50,6 +54,7 @@ from .results import (
 __all__ = [
     # factory / registry
     "get_detector",
+    "get_inspection_detector",
     "available_modes",
     "resolve_mode",
     "config_class_for",
@@ -77,6 +82,10 @@ __all__ = [
     "ClearBagConfig",
     "ClearBagDetector",
     "ClearBagResult",
+    # inspection mode (dual-camera + OpenAI)
+    "InspectionConfig",
+    "InspectionDetector",
+    "InspectionResult",
     # backwards-compatible aliases
     "ProductDetectionConfig",
     "ProductDetector",

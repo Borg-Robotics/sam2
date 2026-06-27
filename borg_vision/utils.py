@@ -1,6 +1,23 @@
 """Small shared helpers (formatting and scoring ramps)."""
 
 
+def _long_axis_angle_deg(w_px, h_px, angle_deg):
+    """Normalize a cv2.minAreaRect angle to the rect's LONG axis.
+
+    cv2.minAreaRect reports the angle of the *width* (w_px) side. Dimensions are
+    assigned with length = max(w_px, h_px), so when the width is the short side
+    the reported angle is 90 deg off from the length axis. Add 90 deg in that
+    case so angle_deg always describes the long-axis direction, then wrap into
+    (-90, 90]. Consumers (ROS pose yaw, debug overlays) can rely on angle_deg
+    meaning the same thing as `length`.
+    """
+    if h_px > w_px:
+        angle_deg += 90.0
+    # Wrap into (-90, 90]; a rectangle's long-axis direction is 180-periodic.
+    angle_deg = (angle_deg + 90.0) % 180.0 - 90.0
+    return float(angle_deg)
+
+
 def json_number(value):
     if value is None:
         return None

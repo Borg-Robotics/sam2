@@ -7,6 +7,7 @@ BaseDetector holds the shared OAK-D + SAM2 lifecycle; each mode subclasses it.
 from .base import BaseDetector
 from .box import BoxDetector
 from .clear_bag import ClearBagDetector
+from .inspection import InspectionDetector
 from .object import ObjectDetector
 from .package import PackageDetector
 from .polymailer import PolymailerDetector
@@ -21,5 +22,6 @@ __all__ = [
     "BoxDetector",
     "PolymailerDetector",
     "ClearBagDetector",
+    "InspectionDetector",
     "ProductDetector",
 ]

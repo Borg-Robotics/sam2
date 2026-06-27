@@ -8,6 +8,7 @@ registered in MODES as they are ported from unified_detector_all_in_one.py.
 from .config import (
     BoxConfig,
     ClearBagConfig,
+    InspectionConfig,
     ObjectConfig,
     PackageConfig,
     PolymailerConfig,
@@ -15,6 +16,7 @@ from .config import (
 from .detectors import (
     BoxDetector,
     ClearBagDetector,
+    InspectionDetector,
     ObjectDetector,
     PackageDetector,
     PolymailerDetector,
@@ -27,6 +29,11 @@ MODES = {
     "box": (BoxDetector, BoxConfig),
     "polymailer": (PolymailerDetector, PolymailerConfig),
     "clear_bag": (ClearBagDetector, ClearBagConfig),
+    # Inspection is a dual-camera mode with a different detector signature
+    # (two mxids, no shared OakCamera/SAM2). It is built via
+    # get_inspection_detector(), NOT get_detector(); it lives here so
+    # config_class_for("inspection") works for YAML override loading.
+    "inspection": (InspectionDetector, InspectionConfig),
 }
 
 # Aliases so callers can use either the station name or the legacy "product".
@@ -67,7 +74,14 @@ def get_detector(mode, cfg=None, mxid=None, torch_device=None, camera=None):
     `mxid` is ignored (the shared camera already owns the device) and the
     detector will not open/close it.
     """
-    detector_class, config_class = MODES[resolve_mode(mode)]
+    resolved = resolve_mode(mode)
+    if resolved == "inspection":
+        raise ValueError(
+            "Inspection is a dual-camera mode; use get_inspection_detector("
+            "cfg, mxid_1, mxid_2) instead of get_detector()."
+        )
+
+    detector_class, config_class = MODES[resolved]
 
     if cfg is None:
         cfg = config_class()
@@ -75,3 +89,18 @@ def get_detector(mode, cfg=None, mxid=None, torch_device=None, camera=None):
         cfg = config_class.from_yaml(cfg)
 
     return detector_class(cfg, mxid=mxid, torch_device=torch_device, camera=camera)
+
+
+def get_inspection_detector(cfg=None, mxid_1=None, mxid_2=None):
+    """Build the dual-camera InspectionDetector.
+
+    cfg may be None (default InspectionConfig), an InspectionConfig instance, or
+    a path to a YAML file of overrides. mxid_1/mxid_2 select the two OAK devices
+    (both None = first two available).
+    """
+    if cfg is None:
+        cfg = InspectionConfig()
+    elif isinstance(cfg, str):
+        cfg = InspectionConfig.from_yaml(cfg)
+
+    return InspectionDetector(cfg, mxid_1=mxid_1, mxid_2=mxid_2)
