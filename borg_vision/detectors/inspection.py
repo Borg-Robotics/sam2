@@ -167,8 +167,13 @@ class InspectionDetector:
             if isinstance(message, dai.ImgFrame):
                 return message.getCvFrame()
 
-    def capture(self, session_dir, count=None, should_abort=None):
+    def capture(self, session_dir, count=None, should_abort=None,
+                orientation_index=None):
         """Grab `count` frames alternating between the two cameras, save as JPEGs.
+
+        When `orientation_index` is given the angle is encoded in each filename
+        (so frames from different inspection orientations can be told apart and
+        the files do not collide when capturing into the same session twice).
 
         Returns the list of saved image Paths, or None if aborted.
         """
@@ -185,6 +190,7 @@ class InspectionDetector:
 
         camera_ids = [self.camera_id_1, self.camera_id_2]
         quality = self.cfg.capture_jpeg_quality
+        ori_tag = "" if orientation_index is None else f"ori{orientation_index:02d}_"
         saved_paths = []
 
         for i in range(count):
@@ -196,7 +202,7 @@ class InspectionDetector:
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = (
-                f"frame_{i:04d}_camera{cam_index + 1}_"
+                f"frame_{ori_tag}{i:04d}_camera{cam_index + 1}_"
                 f"{timestamp}_{camera_ids[cam_index]}.jpg"
             )
             path = camera_dirs[cam_index] / filename
@@ -206,6 +212,36 @@ class InspectionDetector:
             saved_paths.append(path)
 
         return saved_paths
+
+    def session_dir_for(self, session_id):
+        """Absolute capture/analysis directory for a session id."""
+        return Path(self.cfg.save_dir) / session_id
+
+    def capture_into(self, session_id, orientation_index, count=None,
+                     should_abort=None):
+        """Capture frames for one orientation into a session, appending.
+
+        Used by the granular CaptureFrames action: frames accumulate across
+        calls under save_dir/<session_id>/ (the dir is NOT cleared), each tagged
+        with `orientation_index`. A later analyze_session() runs one OpenAI
+        inspection over every frame in the session.
+
+        Returns the list of saved image Paths for this call, or None if aborted.
+        """
+        session_dir = self.session_dir_for(session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return self.capture(
+            session_dir,
+            count=count,
+            should_abort=should_abort,
+            orientation_index=orientation_index,
+        )
+
+    def _session_frames(self, session_dir):
+        """All captured JPEGs under a session dir, in stable sorted order."""
+        session_dir = Path(session_dir)
+        frames = sorted(session_dir.glob("camera_*/*.jpg"))
+        return frames
 
     # ------------------------------------------------------------- inspect
 
@@ -242,6 +278,39 @@ class InspectionDetector:
 
         return InspectionResult.from_run(
             run, product_name=product_name, request_id=request_id,
+            image_paths=image_paths,
+        )
+
+    def analyze_session(self, session_id, product_name, on_stage=None):
+        """Run ONE OpenAI inspection over every frame already captured for a session.
+
+        Generalizes the second half of inspect() to "all frames on disk": it does
+        not capture; it globs save_dir/<session_id>/camera_*/ for the frames that
+        prior capture_into() calls saved and inspects them together.
+
+        on_stage(stage) is called with "inspecting" if provided.
+        Returns an InspectionResult. Raises if the session has no frames.
+        """
+        session_dir = self.session_dir_for(session_id)
+        image_paths = self._session_frames(session_dir)
+        if not image_paths:
+            raise RuntimeError(
+                f"No captured frames found for session '{session_id}' "
+                f"(looked under {session_dir})"
+            )
+
+        if on_stage is not None:
+            on_stage("inspecting")
+        run = run_inspection(
+            self.cfg,
+            image_paths,
+            product_name,
+            request_id=session_id,
+            optimized_dir=session_dir / "optimized",
+        )
+
+        return InspectionResult.from_run(
+            run, product_name=product_name, request_id=session_id,
             image_paths=image_paths,
         )
 
