@@ -8,15 +8,20 @@ name and returns a structured inspection verdict
 The OpenAI API key is read from the OPENAI_API_KEY environment variable only;
 it is never stored in config. `run_inspection(cfg, image_paths, product_name)`
 is the single entry point used by the InspectionDetector and the CLI.
+
+`requests` and `Pillow` are imported lazily inside the functions that use them
+(not at module top) so that importing `borg_vision` -- which pulls this module in
+via the detectors package -- never requires the inspection-only HTTP/image deps.
+A machine that only runs the SAM2 segmentation modes therefore does not need
+them; only actually running an inspection does (see the `borg` extra in
+setup.py). The lazy import raises a clear "pip install" message if they are
+missing.
 """
 
 import base64
 import json
 import os
 from pathlib import Path
-
-import requests
-from PIL import Image, ImageOps
 
 
 def build_prompt(product_name):
@@ -138,6 +143,14 @@ def build_prompt(product_name):
 
 def optimize_image(input_path, output_dir, request_id, max_size, quality):
     """Write a smaller, EXIF-normalized JPEG copy for the API and return its path."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise RuntimeError(
+            "Pillow is required to run a product inspection. Install the "
+            "inspection deps with: pip install 'SAM-2[borg]' (or pip install Pillow)."
+        ) from e
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{input_path.stem}-{request_id}-opt.jpg"
@@ -189,6 +202,14 @@ def extract_output_text(response_json):
 
 
 def call_openai(api_key, model, openai_url, product_name, image_paths, timeout_s):
+    try:
+        import requests
+    except ImportError as e:
+        raise RuntimeError(
+            "requests is required to run a product inspection. Install the "
+            "inspection deps with: pip install 'SAM-2[borg]' (or pip install requests)."
+        ) from e
+
     content = [{"type": "input_text", "text": build_prompt(product_name)}]
 
     for image_path in image_paths:

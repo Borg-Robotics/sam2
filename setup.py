@@ -55,6 +55,9 @@ EXTRA_PACKAGES = {
         "pyzbar>=0.1.9",
         "opencv-python>=4.7.0",
         "PyYAML>=5.4",
+        # Product-inspection mode (borg_vision/inspection.py): OpenAI HTTP call
+        # + image optimization. pillow is already a core REQUIRED_PACKAGES dep.
+        "requests>=2.28",
     ],
     "dev": [
         "black==24.2.0",
