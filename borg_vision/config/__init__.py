@@ -13,6 +13,7 @@ from .inspection import InspectionConfig
 from .object import ObjectConfig
 from .package import PackageConfig
 from .polymailer import PolymailerConfig
+from .polymailer_release import PolymailerReleaseConfig
 
 # Backwards-compatible alias for the pre-refactor single-mode config name.
 ProductDetectionConfig = PackageConfig
@@ -23,6 +24,7 @@ __all__ = [
     "ObjectConfig",
     "BoxConfig",
     "PolymailerConfig",
+    "PolymailerReleaseConfig",
     "ClearBagConfig",
     "InspectionConfig",
     "ProductDetectionConfig",
