@@ -12,6 +12,7 @@ from .config import (
     ObjectConfig,
     PackageConfig,
     PolymailerConfig,
+    PolymailerReleaseConfig,
 )
 from .detectors import (
     BoxDetector,
@@ -20,6 +21,7 @@ from .detectors import (
     ObjectDetector,
     PackageDetector,
     PolymailerDetector,
+    PolymailerReleaseDetector,
 )
 
 #: mode name -> (detector class, config class)
@@ -28,6 +30,9 @@ MODES = {
     "object": (ObjectDetector, ObjectConfig),
     "box": (BoxDetector, BoxConfig),
     "polymailer": (PolymailerDetector, PolymailerConfig),
+    # Continuous monitor mode: drive it via start_monitoring()/process_frame()
+    # rather than detect() (see PolymailerReleaseDetector).
+    "polymailer_release": (PolymailerReleaseDetector, PolymailerReleaseConfig),
     "clear_bag": (ClearBagDetector, ClearBagConfig),
     # Inspection is a dual-camera mode with a different detector signature
     # (two mxids, no shared OakCamera/SAM2). It is built via

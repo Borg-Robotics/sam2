@@ -21,6 +21,7 @@ from .config import (
     ObjectConfig,
     PackageConfig,
     PolymailerConfig,
+    PolymailerReleaseConfig,
     ProductDetectionConfig,
 )
 from .detectors import (
@@ -28,10 +29,13 @@ from .detectors import (
     BoxDetector,
     ClearBagDetector,
     InspectionDetector,
+    MonitorUpdate,
     ObjectDetector,
     PackageDetector,
     PolymailerDetector,
+    PolymailerReleaseDetector,
     ProductDetector,
+    ReleasePhase,
 )
 from .registry import (
     available_modes,
@@ -47,6 +51,7 @@ from .results import (
     InspectionResult,
     ObjectResult,
     PackageResult,
+    PolymailerReleaseResult,
     PolymailerResult,
     ProductDetectionResult,
 )
@@ -78,6 +83,12 @@ __all__ = [
     "PolymailerConfig",
     "PolymailerDetector",
     "PolymailerResult",
+    # polymailer release monitor mode (continuous)
+    "PolymailerReleaseConfig",
+    "PolymailerReleaseDetector",
+    "PolymailerReleaseResult",
+    "ReleasePhase",
+    "MonitorUpdate",
     # clear_bag mode
     "ClearBagConfig",
     "ClearBagDetector",
