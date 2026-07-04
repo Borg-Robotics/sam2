@@ -11,6 +11,11 @@ from .inspection import InspectionDetector
 from .object import ObjectDetector
 from .package import PackageDetector
 from .polymailer import PolymailerDetector
+from .polymailer_release import (
+    MonitorUpdate,
+    PolymailerReleaseDetector,
+    ReleasePhase,
+)
 
 # Backwards-compatible alias for the pre-refactor single-mode detector name.
 ProductDetector = PackageDetector
@@ -21,6 +26,9 @@ __all__ = [
     "ObjectDetector",
     "BoxDetector",
     "PolymailerDetector",
+    "PolymailerReleaseDetector",
+    "ReleasePhase",
+    "MonitorUpdate",
     "ClearBagDetector",
     "InspectionDetector",
     "ProductDetector",

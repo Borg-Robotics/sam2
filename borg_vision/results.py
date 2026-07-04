@@ -111,6 +111,72 @@ class BoxResult(BaseResult):
 
 
 @dataclass
+class PolymailerReleaseResult(BaseResult):
+    """Latched outcome of the polymailer product-release monitor (units: mm,
+    camera frame: x right, y down, z = depth forward).
+
+    Built when the monitor latches FULL PRODUCT OUT; `raw` carries the latched
+    candidate dict (mask + metrics) and `frames` the frame at latch time.
+    """
+
+    released: bool = False
+    product_center_x_mm: Optional[float] = None
+    product_center_y_mm: Optional[float] = None
+    product_depth_mm: Optional[float] = None
+    height_above_base_mm: Optional[float] = None
+    phase_history: List = field(default_factory=list)
+
+    @classmethod
+    def from_candidate(cls, cfg, candidate, frames, intrinsics, phase_history):
+        import numpy as np
+
+        from .detection.package import pixel_to_camera_xy_mm
+
+        height_mm = candidate.get("height_above_base_mm")
+        depth_mm = None
+
+        # Robust product depth: median valid depth inside the latched mask,
+        # falling back to base depth minus the measured height.
+        mask = candidate.get("mask")
+        if mask is not None and frames is not None:
+            depth_roi = frames.depth_class_aligned[
+                cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2
+            ]
+            values = depth_roi[
+                (mask == 1)
+                & (depth_roi > cfg.min_valid_depth_mm)
+                & (depth_roi < cfg.max_valid_depth_mm)
+            ]
+            if values.size > 0:
+                depth_mm = float(np.median(values.astype(np.float32)))
+
+        if depth_mm is None and height_mm is not None:
+            depth_mm = float(cfg.base_depth_mm) - float(height_mm)
+
+        center = candidate.get("center")
+        x_mm = y_mm = None
+        if center is not None and depth_mm is not None:
+            center_full = (
+                float(center[0]) + cfg.roi_x1,
+                float(center[1]) + cfg.roi_y1,
+            )
+            x_mm, y_mm = pixel_to_camera_xy_mm(center_full, depth_mm, intrinsics)
+
+        return cls(
+            raw={"candidate": candidate},
+            frames=frames,
+            released=True,
+            product_center_x_mm=x_mm,
+            product_center_y_mm=y_mm,
+            product_depth_mm=depth_mm,
+            height_above_base_mm=(
+                float(height_mm) if height_mm is not None else None
+            ),
+            phase_history=list(phase_history),
+        )
+
+
+@dataclass
 class PolymailerResult(BaseResult):
     """Polymailer measurement + product bulge inside (units: mm / deg, camera
     frame: x right, y down, z = depth forward)."""
