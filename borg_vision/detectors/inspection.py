@@ -86,6 +86,9 @@ class InspectionDetector:
 
         # Per-camera (pipeline, device, rgb_queue) once opened.
         self._cams = []
+        # Last returned frame sequence number per camera index, so _grab_frame
+        # never returns the same buffered frame twice (avoids duplicate images).
+        self._last_seq = {}
 
     # ----------------------------------------------------------- lifecycle
 
@@ -121,6 +124,7 @@ class InspectionDetector:
         if self._cams:
             return self
 
+        self._last_seq = {}
         self._device_info_1, self._device_info_2 = resolve_camera_pair(
             self.mxid_1, self.mxid_2
         )
@@ -152,6 +156,7 @@ class InspectionDetector:
             except Exception as e:
                 print(f"Error closing inspection device: {e}")
         self._cams = []
+        self._last_seq = {}
 
     @property
     def is_open(self):
@@ -160,56 +165,78 @@ class InspectionDetector:
     # ------------------------------------------------------------- capture
 
     def _grab_frame(self, cam_index):
-        """Block for a fresh frame from the given camera (0 or 1)."""
+        """Block for a genuinely fresh frame from the given camera (0 or 1).
+
+        The DepthAI output queue is non-blocking with a small buffer, so two
+        back-to-back get()s can hand back the SAME buffered ImgFrame. We skip any
+        frame whose sequence number matches the last one returned for this camera
+        so every saved image is a new sensor frame (no duplicate captures).
+        """
         cam = self._cams[cam_index]
         while True:
             message = cam["queue"].get()
-            if isinstance(message, dai.ImgFrame):
-                return message.getCvFrame()
+            if not isinstance(message, dai.ImgFrame):
+                continue
+            try:
+                seq = message.getSequenceNum()
+            except AttributeError:
+                seq = None  # no seq API -> can't dedup, accept the frame
+            if seq is not None and seq == self._last_seq.get(cam_index):
+                continue  # same buffered frame as last grab -> wait for a new one
+            self._last_seq[cam_index] = seq
+            return message.getCvFrame()
 
     def capture(self, session_dir, count=None, should_abort=None,
-                orientation_index=None):
-        """Grab `count` frames alternating between the two cameras, save as JPEGs.
+                orientation_index=None, cam_indices=None):
+        """Grab fresh frames from selected cameras and save them as JPEGs.
 
-        When `orientation_index` is given the angle is encoded in each filename
-        (so frames from different inspection orientations can be told apart and
-        the files do not collide when capturing into the same session twice).
+        For each selected camera (`cam_indices`, 0-based; defaults to all open
+        cameras) `count` genuinely-fresh frames are grabbed and saved -- so with
+        the default count=1 this is exactly one image per selected camera. When
+        `orientation_index` is given the angle is encoded in each filename (so
+        frames from different inspection orientations can be told apart and the
+        files do not collide when capturing into the same session twice).
 
-        Returns the list of saved image Paths, or None if aborted.
+        Returns the list of saved image Paths (possibly empty if no camera is
+        selected), or None if aborted.
         """
         if not self._cams:
             raise RuntimeError("InspectionDetector is not open; call open() first")
 
         if count is None:
             count = self.cfg.capture_count
+        if cam_indices is None:
+            cam_indices = list(range(len(self._cams)))
 
         session_dir = Path(session_dir)
-        camera_dirs = [session_dir / "camera_1", session_dir / "camera_2"]
-        for d in camera_dirs:
-            d.mkdir(parents=True, exist_ok=True)
-
         camera_ids = [self.camera_id_1, self.camera_id_2]
         quality = self.cfg.capture_jpeg_quality
         ori_tag = "" if orientation_index is None else f"ori{orientation_index:02d}_"
         saved_paths = []
 
-        for i in range(count):
-            if should_abort is not None and should_abort():
-                return None
+        i = 0
+        for cam_index in cam_indices:
+            camera_dir = session_dir / f"camera_{cam_index + 1}"
+            camera_dir.mkdir(parents=True, exist_ok=True)
+            for _ in range(count):
+                if should_abort is not None and should_abort():
+                    return None
 
-            cam_index = i % 2
-            frame = self._grab_frame(cam_index)
+                frame = self._grab_frame(cam_index)
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = (
-                f"frame_{ori_tag}{i:04d}_camera{cam_index + 1}_"
-                f"{timestamp}_{camera_ids[cam_index]}.jpg"
-            )
-            path = camera_dirs[cam_index] / filename
-            saved = cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-            if not saved:
-                raise RuntimeError(f"Failed to save inspection frame {i}.")
-            saved_paths.append(path)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                filename = (
+                    f"frame_{ori_tag}{i:04d}_camera{cam_index + 1}_"
+                    f"{timestamp}_{camera_ids[cam_index]}.jpg"
+                )
+                path = camera_dir / filename
+                saved = cv2.imwrite(
+                    str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, quality]
+                )
+                if not saved:
+                    raise RuntimeError(f"Failed to save inspection frame {i}.")
+                saved_paths.append(path)
+                i += 1
 
         return saved_paths
 
@@ -230,11 +257,13 @@ class InspectionDetector:
         """
         session_dir = self.session_dir_for(session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
+        cam_indices = self.cfg.cameras_for(orientation_index, len(self._cams))
         return self.capture(
             session_dir,
             count=count,
             should_abort=should_abort,
             orientation_index=orientation_index,
+            cam_indices=cam_indices,
         )
 
     def _session_frames(self, session_dir):

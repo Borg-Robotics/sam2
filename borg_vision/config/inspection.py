@@ -21,7 +21,12 @@ class InspectionConfig:
     save_dir: str = "inspection_results"
 
     # ----- dual-camera RGB capture -------------------------------------
-    capture_count: int = 4
+    capture_count: int = 1        # fresh frames per SELECTED camera per orientation
+    # Which orientations each camera captures at. None -> every camera captures
+    # at every orientation (legacy behavior). Otherwise a per-camera map:
+    #   {"camera_1": [0], "camera_2": "all"}
+    # values are "all" or a list of 0-based orientation indices (0 = default pose).
+    capture_schedule: dict = None
     rgb_size: tuple = (1280, 720)
     fps: int = 20
     startup_delay_seconds: float = 2.0
@@ -71,3 +76,52 @@ class InspectionConfig:
             data = yaml.safe_load(f) or {}
 
         return cls.from_dict(data)
+
+    # ----- capture schedule --------------------------------------------
+
+    def cameras_for(self, orientation_index, num_cameras=2):
+        """0-based device indices that capture at `orientation_index`.
+
+        Resolves `capture_schedule` (a per-camera map keyed "camera_1".."camera_N",
+        each value "all" or a list of 0-based orientation indices). A camera not
+        listed captures nothing. When `capture_schedule` is None/empty every
+        camera captures at every orientation (legacy behavior).
+
+        Raises ValueError on a malformed schedule (bad camera key or a value that
+        is neither "all" nor an int list).
+        """
+        schedule = self.capture_schedule
+        if not schedule:
+            return list(range(num_cameras))
+
+        valid_keys = {f"camera_{n}" for n in range(1, num_cameras + 1)}
+        selected = []
+        for key, when in schedule.items():
+            if key not in valid_keys:
+                raise ValueError(
+                    f"Invalid capture_schedule camera '{key}'; "
+                    f"expected one of {sorted(valid_keys)}"
+                )
+            cam_index = int(key.split("_")[1]) - 1  # camera_1 -> 0
+
+            if isinstance(when, str):
+                if when != "all":
+                    raise ValueError(
+                        f"Invalid capture_schedule value for {key}: '{when}'; "
+                        "expected \"all\" or a list of orientation indices"
+                    )
+                selected.append(cam_index)
+            elif isinstance(when, (list, tuple)):
+                if not all(isinstance(i, int) for i in when):
+                    raise ValueError(
+                        f"capture_schedule[{key}] must be a list of int indices"
+                    )
+                if orientation_index in when:
+                    selected.append(cam_index)
+            else:
+                raise ValueError(
+                    f"Invalid capture_schedule value for {key}: {when!r}; "
+                    "expected \"all\" or a list of orientation indices"
+                )
+
+        return sorted(selected)
