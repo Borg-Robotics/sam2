@@ -8,6 +8,7 @@ to the original product_detection_final.py script. Differences:
   backpressure on the device.
 """
 
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -234,6 +235,17 @@ class OakCamera:
         set_ir(self.cfg, self._device)
         self._intrinsics = get_rgb_intrinsics(self.cfg, self._device)
 
+        return self
+
+    def warmup(self, seconds):
+        """Pump and discard frames for `seconds` so autoexposure settles.
+
+        Camera-level (shared by every mode on this device): meant to run once
+        right after open(), not before each detection.
+        """
+        start = time.time()
+        while time.time() - start < seconds:
+            self.get_frames()
         return self
 
     @property

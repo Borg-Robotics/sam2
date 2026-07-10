@@ -204,6 +204,8 @@ class InspectionResult:
         )
 
     def to_json_dict(self):
+        # image_paths/optimized_image_paths stay on the dataclass but are left
+        # out of the report JSON: the images already live in the session dir.
         return {
             "request_id": self.request_id,
             "product_name": self.product_name,
@@ -212,8 +214,6 @@ class InspectionResult:
             "summary": self.summary,
             "reasons": list(self.reasons),
             "observed_defects": list(self.observed_defects),
-            "image_paths": list(self.image_paths),
-            "optimized_image_paths": list(self.optimized_image_paths),
             "usage": self.usage,
             "raw_response_id": self.raw_response_id,
         }
