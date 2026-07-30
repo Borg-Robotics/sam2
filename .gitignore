@@ -10,3 +10,6 @@ outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
 .cache/
+# Detector output dirs (every mode's save_dir ends in _results): annotated
+# PNGs, raw JPGs, masks and measurement JSON. Regenerated on every run.
+*_results/
