@@ -127,6 +127,18 @@ class PolymailerResult(BaseResult):
     product_inside_center_y_mm: Optional[float] = None
     product_inside_center_face_depth: Optional[float] = None
 
+    # Cut guidance: which end of the polymailer has the most clearance from the
+    # product, and the camera-frame midpoints of its top/bottom edge lines.
+    cut_side: Optional[str] = None                      # "TOP" | "BOTTOM"
+    top_gap_mm: Optional[float] = None
+    bottom_gap_mm: Optional[float] = None
+    top_edge_x_mm: Optional[float] = None
+    top_edge_y_mm: Optional[float] = None
+    top_edge_z_mm: Optional[float] = None
+    bottom_edge_x_mm: Optional[float] = None
+    bottom_edge_y_mm: Optional[float] = None
+    bottom_edge_z_mm: Optional[float] = None
+
     @classmethod
     def from_raw(cls, raw, frames):
         return cls(raw=raw, frames=frames, **raw["final_output"])

@@ -286,6 +286,113 @@ def estimate_product_inside_polymailer(cfg, depth_roi, poly_mask, poly_center_ro
     }
 
 
+def choose_cut_side(cfg, poly_mask, product, intrinsics, depth_mm):
+    """Pick which side to cut across (horizontal cut).
+
+    Compares the empty space between the product and the TOP edge of the
+    polymailer vs the product and the BOTTOM edge, and recommends cutting on
+    whichever side has the most clearance from the product.
+    """
+    result = {
+        "cut_side": None,
+        "top_gap_px": 0,
+        "bottom_gap_px": 0,
+        "top_gap_mm": None,
+        "bottom_gap_mm": None,
+        "cut_row_full": None,
+    }
+
+    product_mask = product["mask"]
+
+    if int(product_mask.sum()) == 0:
+        return result
+
+    poly_rows = np.where(poly_mask.any(axis=1))[0]
+    prod_rows = np.where(product_mask.any(axis=1))[0]
+
+    if poly_rows.size == 0 or prod_rows.size == 0:
+        return result
+
+    poly_top = int(poly_rows[0])
+    poly_bottom = int(poly_rows[-1])
+    prod_top = int(prod_rows[0])
+    prod_bottom = int(prod_rows[-1])
+
+    top_gap_px = max(prod_top - poly_top, 0)
+    bottom_gap_px = max(poly_bottom - prod_bottom, 0)
+
+    if top_gap_px >= bottom_gap_px:
+        cut_side = "TOP"
+        cut_row_roi = (poly_top + prod_top) // 2
+    else:
+        cut_side = "BOTTOM"
+        cut_row_roi = (prod_bottom + poly_bottom) // 2
+
+    if intrinsics is not None and depth_mm is not None:
+        fy = intrinsics["fy"]
+        result["top_gap_mm"] = float(top_gap_px * depth_mm / fy)
+        result["bottom_gap_mm"] = float(bottom_gap_px * depth_mm / fy)
+
+    result["cut_side"] = cut_side
+    result["top_gap_px"] = int(top_gap_px)
+    result["bottom_gap_px"] = int(bottom_gap_px)
+    result["cut_row_full"] = int(cfg.roi_y1 + cut_row_roi)
+
+    return result
+
+
+def measure_edge_points(cfg, poly, dimensions, depth_roi, face_depth_mm, intrinsics):
+    """Camera-frame X/Y/Z of the midpoints of the top and bottom lines of the
+    polymailer's bounding box (the rotated outline drawn on screen), so the
+    points sit centered on those edge lines."""
+    points_full = dimensions.get("points_full")
+
+    if points_full is not None and len(points_full) == 4:
+        pts = sorted(points_full, key=lambda p: p[1])
+        top_edge_full = (
+            int(round((pts[0][0] + pts[1][0]) / 2)),
+            int(round((pts[0][1] + pts[1][1]) / 2)),
+        )
+        bottom_edge_full = (
+            int(round((pts[2][0] + pts[3][0]) / 2)),
+            int(round((pts[2][1] + pts[3][1]) / 2)),
+        )
+    else:
+        bx, by, bw, bh = poly["bbox"]
+        cx_full = cfg.roi_x1 + int(bx + bw / 2)
+        top_edge_full = (cx_full, cfg.roi_y1 + int(by))
+        bottom_edge_full = (cx_full, cfg.roi_y1 + int(by + bh - 1))
+
+    top_edge_roi = (top_edge_full[0] - cfg.roi_x1, top_edge_full[1] - cfg.roi_y1)
+    bottom_edge_roi = (bottom_edge_full[0] - cfg.roi_x1, bottom_edge_full[1] - cfg.roi_y1)
+
+    top_edge_depth, _ = center_depth_mm(cfg, depth_roi, poly["mask"], top_edge_roi)
+    bottom_edge_depth, _ = center_depth_mm(cfg, depth_roi, poly["mask"], bottom_edge_roi)
+
+    if top_edge_depth is None:
+        top_edge_depth = face_depth_mm
+    if bottom_edge_depth is None:
+        bottom_edge_depth = face_depth_mm
+
+    top_edge_x_mm, top_edge_y_mm = pixel_to_camera_xy_mm(
+        top_edge_full, top_edge_depth, intrinsics
+    )
+    bottom_edge_x_mm, bottom_edge_y_mm = pixel_to_camera_xy_mm(
+        bottom_edge_full, bottom_edge_depth, intrinsics
+    )
+
+    return {
+        "top_x_mm": top_edge_x_mm,
+        "top_y_mm": top_edge_y_mm,
+        "top_z_mm": top_edge_depth,
+        "top_point_full": top_edge_full,
+        "bottom_x_mm": bottom_edge_x_mm,
+        "bottom_y_mm": bottom_edge_y_mm,
+        "bottom_z_mm": bottom_edge_depth,
+        "bottom_point_full": bottom_edge_full,
+    }
+
+
 def choose_polymailer_mask(cfg, masks, roi_rgb):
     h, w = roi_rgb.shape[:2]
     roi_area = h * w
@@ -423,6 +530,23 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
         poly_center_roi=poly_center_roi,
     )
 
+    cut = choose_cut_side(
+        cfg,
+        poly_mask=poly["mask"],
+        product=product,
+        intrinsics=intrinsics,
+        depth_mm=polymailer_face_depth_mm,
+    )
+
+    edges = measure_edge_points(
+        cfg,
+        poly=poly,
+        dimensions=dimensions,
+        depth_roi=depth_roi,
+        face_depth_mm=polymailer_face_depth_mm,
+        intrinsics=intrinsics,
+    )
+
     depth_heatmap = make_polymailer_depth_heatmap(
         cfg,
         depth_roi=depth_roi,
@@ -487,6 +611,8 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
         "product_inside_center_x_mm": product_inside_center_x_mm,
         "product_inside_center_y_mm": product_inside_center_y_mm,
         "product_inside_center_face_depth": product_inside_center_face_depth,
+        "cut": cut,
+        "edges": edges,
         "depth_heatmap": depth_heatmap,
         "final_output": {
             "polymailer_face_depth_mm": polymailer_face_depth_mm,
@@ -500,5 +626,14 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
             "product_inside_center_x_mm": product_inside_center_x_mm,
             "product_inside_center_y_mm": product_inside_center_y_mm,
             "product_inside_center_face_depth": product_inside_center_face_depth,
+            "cut_side": cut["cut_side"],
+            "top_gap_mm": cut["top_gap_mm"],
+            "bottom_gap_mm": cut["bottom_gap_mm"],
+            "top_edge_x_mm": edges["top_x_mm"],
+            "top_edge_y_mm": edges["top_y_mm"],
+            "top_edge_z_mm": edges["top_z_mm"],
+            "bottom_edge_x_mm": edges["bottom_x_mm"],
+            "bottom_edge_y_mm": edges["bottom_y_mm"],
+            "bottom_edge_z_mm": edges["bottom_z_mm"],
         },
     }

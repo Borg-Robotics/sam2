@@ -10,5 +10,6 @@ outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
 .cache/
-cardboard_box_depth_results/
-package_barcode_detection_results/
+# Detector output dirs (every mode's save_dir ends in _results): annotated
+# PNGs, raw JPGs, masks and measurement JSON. Regenerated on every run.
+*_results/

@@ -26,7 +26,7 @@ class BoxConfig(BaseConfig):
 
     # Locked ROI.
     roi_x1: int = 330
-    roi_y1: int = 60
+    roi_y1: int = 30
     roi_x2: int = 940
     roi_y2: int = 700
 

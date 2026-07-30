@@ -139,6 +139,40 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         cv2.circle(depth_vis, (cx, cy), 8, (0, 140, 255), -1)
         cv2.circle(depth_vis, (cx, cy), 16, (0, 140, 255), 2)
 
+    edges = result["edges"]
+
+    for point in (edges["top_point_full"], edges["bottom_point_full"]):
+        ex, ey = point
+        cv2.circle(result_rgb, (ex, ey), 7, (0, 255, 128), -1)
+        cv2.circle(result_rgb, (ex, ey), 14, (0, 255, 128), 2)
+        cv2.circle(depth_vis, (ex, ey), 7, (0, 255, 128), -1)
+        cv2.circle(depth_vis, (ex, ey), 14, (0, 255, 128), 2)
+
+    cut = result["cut"]
+
+    if cut["cut_side"] is not None:
+        bx, _, bw, _ = poly["bbox"]
+        cut_x1 = cfg.roi_x1 + bx
+        cut_x2 = cfg.roi_x1 + bx + bw
+        cut_y = cut["cut_row_full"]
+
+        cv2.line(result_rgb, (cut_x1, cut_y), (cut_x2, cut_y), (0, 255, 0), 3)
+        cv2.line(depth_vis, (cut_x1, cut_y), (cut_x2, cut_y), (0, 255, 0), 3)
+
+        label = f"CUT {cut['cut_side']}"
+        label_y = cut_y - 12 if cut["cut_side"] == "TOP" else cut_y + 30
+
+        cv2.putText(
+            result_rgb,
+            label,
+            (cut_x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
     lines = [
         "POLYMAILER OUTPUT",
         f"polymailer_face_depth_mm={fmt3(result['polymailer_face_depth_mm'])}",
@@ -151,6 +185,10 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         f"product_inside_center_x_mm={fmt3(result['product_inside_center_x_mm'])}",
         f"product_inside_center_y_mm={fmt3(result['product_inside_center_y_mm'])}",
         f"product_inside_center_face_depth={fmt3(result['product_inside_center_face_depth'])}",
+        f"cut_side={cut['cut_side']}",
+        f"top_gap_mm={fmt3(cut['top_gap_mm'])}  bottom_gap_mm={fmt3(cut['bottom_gap_mm'])}",
+        f"top_edge xyz=({fmt3(edges['top_x_mm'])}, {fmt3(edges['top_y_mm'])}, {fmt3(edges['top_z_mm'])})",
+        f"bottom_edge xyz=({fmt3(edges['bottom_x_mm'])}, {fmt3(edges['bottom_y_mm'])}, {fmt3(edges['bottom_z_mm'])})",
     ]
 
     for i, line in enumerate(lines):
@@ -193,6 +231,8 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
 
 def make_json_result(cfg, result, timestamp):
     dimensions = result["dimensions"]
+    cut = result["cut"]
+    edges = result["edges"]
 
     return {
         "polymailer_face_depth_mm": json_number(result["polymailer_face_depth_mm"]),
@@ -205,4 +245,13 @@ def make_json_result(cfg, result, timestamp):
         "product_inside_center_x_mm": json_number(result["product_inside_center_x_mm"]),
         "product_inside_center_y_mm": json_number(result["product_inside_center_y_mm"]),
         "product_inside_center_face_depth": json_number(result["product_inside_center_face_depth"]),
+        "cut_side": cut["cut_side"],
+        "top_gap_mm": json_number(cut["top_gap_mm"]),
+        "bottom_gap_mm": json_number(cut["bottom_gap_mm"]),
+        "top_edge_x_mm": json_number(edges["top_x_mm"]),
+        "top_edge_y_mm": json_number(edges["top_y_mm"]),
+        "top_edge_z_mm": json_number(edges["top_z_mm"]),
+        "bottom_edge_x_mm": json_number(edges["bottom_x_mm"]),
+        "bottom_edge_y_mm": json_number(edges["bottom_y_mm"]),
+        "bottom_edge_z_mm": json_number(edges["bottom_z_mm"]),
     }
