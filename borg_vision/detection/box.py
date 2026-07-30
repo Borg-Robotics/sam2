@@ -14,10 +14,13 @@ import torch
 from .package import (
     clean_box_mask,
     complete_min_area_rectangle,
+    convex_hull_mask,
     get_mask_center,
     get_rotated_box_from_mask,
     mask_iou,
     mask_overlap_fraction,
+    masks_are_near,
+    normalized_rect_angle,
     pixel_to_camera_xy_mm,
     robust_median_depth,
 )
@@ -134,6 +137,7 @@ def score_cardboard_box_candidate(
     sam_iou=0.0,
     sam_stability=0.0,
     source="single_sam_mask",
+    color_score_floor=None,
 ):
     h, w = roi_rgb.shape[:2]
     roi_area = h * w
@@ -181,11 +185,19 @@ def score_cardboard_box_candidate(
     sat_score = 1.0 - min(abs(mean_s - 65.0) / 100.0, 1.0)
     val_score = 1.0 - min(abs(mean_v - 170.0) / 120.0, 1.0)
 
-    color_score = (
+    measured_color_score = (
         0.50 * hue_score
         + 0.25 * sat_score
         + 0.25 * val_score
     )
+
+    # A merged mask spans the box's darker second face, which drags the mean
+    # colour down. The contributing fragment's own colour score is the better
+    # evidence, so callers may floor the merged result with it.
+    color_score = measured_color_score
+
+    if color_score_floor is not None:
+        color_score = max(color_score, float(color_score_floor))
 
     if color_score < cfg.min_box_color_score:
         return None
@@ -228,6 +240,7 @@ def score_cardboard_box_candidate(
         "center_score": float(center_score),
         "area_score": float(area_score),
         "color_score": float(color_score),
+        "measured_color_score": float(measured_color_score),
         "mean_hsv": (mean_h, mean_s, mean_v),
         "sam_iou": float(sam_iou),
         "sam_stability": float(sam_stability),
@@ -346,8 +359,55 @@ def pair_fragment_compatibility(cfg, first, second):
         and x_gap <= cfg.box_merge_max_gap_px
     )
 
+    # Rotation-independent relationship. SAM often splits an angled cardboard
+    # box along its seam; in image coordinates those pieces line up on neither
+    # axis, even though together they form one clean rotated rectangle.
     if not vertical_split_ok and not horizontal_split_ok:
-        return None
+        if not cfg.box_merge_rotated_enable:
+            return None
+
+        first_rotated = get_rotated_box_from_mask(first["mask"])
+        second_rotated = get_rotated_box_from_mask(second["mask"])
+
+        if first_rotated is None or second_rotated is None:
+            return None
+
+        angle_a = normalized_rect_angle(first_rotated)
+        angle_b = normalized_rect_angle(second_rotated)
+        angle_diff = abs(angle_a - angle_b)
+        angle_diff = min(angle_diff, 180.0 - angle_diff)
+
+        center_distance = float(np.hypot(
+            (fx + fw / 2.0) - (sx + sw / 2.0),
+            (fy + fh / 2.0) - (sy + sh / 2.0),
+        ))
+        characteristic_size = max(
+            first_rotated["width_px"],
+            first_rotated["height_px"],
+            second_rotated["width_px"],
+            second_rotated["height_px"],
+            1.0,
+        )
+        center_distance_ratio = center_distance / characteristic_size
+
+        rotated_ok = (
+            angle_diff <= cfg.box_merge_rotated_max_angle_diff_deg
+            and center_distance_ratio
+            <= cfg.box_merge_rotated_max_center_distance_ratio
+        )
+
+        if not rotated_ok:
+            return None
+
+        return {
+            "pair_iou": float(pair_iou),
+            "split_axis": "rotated",
+            "axis_overlap": float(max(x_overlap, y_overlap)),
+            "gap_px": int(min(x_gap, y_gap)),
+            "geometry_mode": "rotated",
+            "angle_diff_deg": float(angle_diff),
+            "center_distance_ratio": float(center_distance_ratio),
+        }
 
     if vertical_split_ok and horizontal_split_ok:
         if x_overlap >= y_overlap:
@@ -372,6 +432,7 @@ def pair_fragment_compatibility(cfg, first, second):
         "split_axis": split_axis,
         "axis_overlap": float(axis_overlap),
         "gap_px": int(gap_px),
+        "geometry_mode": "axis_aligned",
     }
 
 
@@ -416,8 +477,25 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
             largest_fragment_area = max(first_area, second_area)
             completed_area = int(completed_mask.sum())
             area_growth = completed_area / max(largest_fragment_area, 1)
+            union_area = int(union_mask.sum())
+            completed_fill_ratio = union_area / max(completed_area, 1)
+            completed_area_ratio = completed_area / max(
+                completed_mask.shape[0] * completed_mask.shape[1],
+                1,
+            )
 
             if area_growth < cfg.box_merge_min_area_growth_over_largest:
+                continue
+
+            # A rotated pair is a weaker signal than an axis-aligned one, so
+            # the completed rectangle must actually be filled by the fragments
+            # and must not swallow the whole ROI.
+            rotated_pair = compatibility["geometry_mode"] == "rotated"
+
+            if rotated_pair and (
+                completed_fill_ratio < cfg.box_merge_rotated_min_completed_fill_ratio
+                or completed_area_ratio > cfg.box_merge_rotated_max_completed_area_ratio
+            ):
                 continue
 
             merged_result = score_cardboard_box_candidate(
@@ -431,6 +509,10 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
                     second["sam_stability"],
                 ),
                 source="cardboard_box_merged_masks",
+                color_score_floor=max(
+                    first.get("color_score", 0.0),
+                    second.get("color_score", 0.0),
+                ),
             )
 
             if merged_result is None:
@@ -450,6 +532,10 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
             merged_result["merged_split_axis"] = compatibility["split_axis"]
             merged_result["merged_axis_overlap"] = compatibility["axis_overlap"]
             merged_result["merged_gap_px"] = compatibility["gap_px"]
+            merged_result["merged_geometry_mode"] = compatibility["geometry_mode"]
+            merged_result["merged_completed_fill_ratio"] = float(
+                completed_fill_ratio
+            )
             merged_result["merged_area_growth"] = float(area_growth)
             merged_result["score_before_merge_bonus"] = float(
                 merged_result["score"]
@@ -466,6 +552,178 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
                 best_merged = merged_result
 
     return best_merged
+
+
+def build_secondary_face_candidates(cfg, masks, roi_rgb):
+    """Score every SAM mask with loose, geometry-only gates.
+
+    The second visible face of an angled box is usually too dark or off-colour
+    to survive the cardboard-box rules, so it never becomes a box candidate and
+    the box is measured as one face. These looser candidates exist purely as
+    merge partners for build_multiface_cardboard_box_candidate.
+    """
+    h, w = roi_rgb.shape[:2]
+    roi_area = h * w
+    roi_cx = w / 2
+    roi_cy = h / 2
+    max_dist = np.sqrt(roi_cx ** 2 + roi_cy ** 2)
+    candidates = []
+
+    for i, item in enumerate(masks):
+        mask = clean_box_mask(cfg, item["segmentation"].astype(np.uint8))
+        area = int(mask.sum())
+        area_ratio = area / max(roi_area, 1)
+
+        if area_ratio < cfg.box_multiface_min_second_area_ratio:
+            continue
+        if area_ratio > cfg.secondary_face_max_area_ratio:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(mask)
+        if bw <= 0 or bh <= 0:
+            continue
+
+        rectangularity = area / max(bw * bh, 1)
+        aspect_ratio = max(bw / max(bh, 1), bh / max(bw, 1))
+
+        if rectangularity < cfg.secondary_face_min_rectangularity:
+            continue
+        if aspect_ratio > cfg.secondary_face_max_aspect_ratio:
+            continue
+
+        center_roi = get_mask_center(mask)
+        if center_roi is None:
+            continue
+
+        dist = np.hypot(center_roi[0] - roi_cx, center_roi[1] - roi_cy)
+        center_score = 1.0 - min(dist / max(max_dist, 1.0), 1.0)
+
+        if center_score < cfg.secondary_face_min_center_score:
+            continue
+
+        candidates.append({
+            "index": i,
+            "mask": mask,
+            "area": area,
+            "area_ratio": float(area_ratio),
+            "bbox": (int(x), int(y), int(bw), int(bh)),
+            "rectangularity": float(rectangularity),
+            "aspect_ratio": float(aspect_ratio),
+            "center_roi": center_roi,
+            "center_score": float(center_score),
+            "sam_iou": float(item.get("predicted_iou", 0.0)),
+            "sam_stability": float(item.get("stability_score", 0.0)),
+        })
+
+    return candidates
+
+
+def build_multiface_cardboard_box_candidate(
+    cfg,
+    box_candidates,
+    secondary_candidates,
+    roi_rgb,
+):
+    if not cfg.box_multiface_merge_enable:
+        return None
+
+    if not box_candidates or not secondary_candidates:
+        return None
+
+    boxes = sorted(
+        box_candidates,
+        key=lambda item: item.get("score", 0.0),
+        reverse=True,
+    )[:cfg.box_multiface_max_candidates]
+    secondary = sorted(
+        secondary_candidates,
+        key=lambda item: item.get("area", int(item["mask"].sum())),
+        reverse=True,
+    )[:cfg.box_multiface_max_candidates]
+
+    roi_area = roi_rgb.shape[0] * roi_rgb.shape[1]
+    best = None
+
+    for box in boxes:
+        box_mask = box["mask"].astype(np.uint8)
+        box_area = int(box_mask.sum())
+
+        for face in secondary:
+            if face.get("index") == box.get("index"):
+                continue
+
+            face_mask = face["mask"].astype(np.uint8)
+            face_area = int(face_mask.sum())
+            face_area_ratio = face_area / max(roi_area, 1)
+
+            if face_area_ratio < cfg.box_multiface_min_second_area_ratio:
+                continue
+
+            pair_iou = mask_iou(box_mask, face_mask)
+            if pair_iou > cfg.box_multiface_max_pair_iou:
+                continue
+
+            if not masks_are_near(
+                box_mask,
+                face_mask,
+                cfg.box_multiface_touch_dilate_px,
+            ):
+                continue
+
+            union_mask = np.logical_or(box_mask, face_mask).astype(np.uint8)
+            hull_mask = convex_hull_mask(union_mask)
+            if hull_mask is None:
+                continue
+
+            hull_area = int(hull_mask.sum())
+            union_area = int(union_mask.sum())
+            largest_area = max(box_area, face_area)
+            area_growth = hull_area / max(largest_area, 1)
+            union_fill_ratio = union_area / max(hull_area, 1)
+            hull_area_ratio = hull_area / max(roi_area, 1)
+
+            if area_growth < cfg.box_multiface_min_area_growth:
+                continue
+            if union_fill_ratio < cfg.box_multiface_min_union_fill_ratio:
+                continue
+            if hull_area_ratio > cfg.box_multiface_max_hull_area_ratio:
+                continue
+
+            merged = score_cardboard_box_candidate(
+                cfg,
+                hull_mask,
+                roi_rgb,
+                index=None,
+                sam_iou=max(box.get("sam_iou", 0.0), face.get("sam_iou", 0.0)),
+                sam_stability=max(
+                    box.get("sam_stability", 0.0),
+                    face.get("sam_stability", 0.0),
+                ),
+                source="cardboard_box_multiface_merge",
+                color_score_floor=box.get("color_score", 0.0),
+            )
+
+            if merged is None:
+                continue
+
+            merged["selection_override"] = "angled_box_multiface_merge"
+            merged["color_score"] = box.get("color_score", merged["color_score"])
+            merged["merged_from_indices"] = [
+                int(box["index"]),
+                int(face["index"]),
+            ]
+            merged["merged_pair_iou"] = float(pair_iou)
+            merged["merged_union_fill_ratio"] = float(union_fill_ratio)
+            merged["merged_area_growth"] = float(area_growth)
+            merged["score_before_merge_bonus"] = float(merged["score"])
+            merged["score"] = float(
+                merged["score"] + cfg.box_multiface_score_bonus
+            )
+
+            if best is None or merged["score"] > best["score"]:
+                best = merged
+
+    return best
 
 
 def choose_cardboard_box_mask(cfg, masks, roi_rgb):
@@ -490,6 +748,15 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
 
         box_candidates.append(candidate)
 
+        if cfg.debug_print_masks:
+            print(
+                f"mask={i:03d} "
+                f"score={candidate['score']:.3f} "
+                f"area={candidate['area_ratio']:.3f} "
+                f"rect={candidate['rectangularity']:.3f} "
+                f"color={candidate['color_score']:.3f}"
+            )
+
     if len(box_candidates) == 0:
         return None
 
@@ -507,13 +774,39 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
         print("MERGED SPLIT BOX CANDIDATE FOUND")
         print(f"  merged SAM indices: {best_merged['merged_from_indices']}")
         print(f"  split axis:         {best_merged['merged_split_axis']}")
+        print(f"  geometry mode:      {best_merged['merged_geometry_mode']}")
         print(f"  axis overlap:       {best_merged['merged_axis_overlap']:.3f}")
         print(f"  gap px:             {best_merged['merged_gap_px']}")
+        print(
+            "  completed fill:     "
+            f"{best_merged['merged_completed_fill_ratio']:.3f}"
+        )
         print(f"  area growth:        {best_merged['merged_area_growth']:.3f}")
         print(f"  merged score:       {best_merged['score']:.3f}")
 
         if selected is None or best_merged["score"] > selected["score"]:
             selected = best_merged
+
+    multiface = build_multiface_cardboard_box_candidate(
+        cfg,
+        box_candidates,
+        build_secondary_face_candidates(cfg, masks, roi_rgb),
+        roi_rgb,
+    )
+
+    if multiface is not None:
+        print()
+        print("ANGLED MULTI-FACE BOX CANDIDATE FOUND")
+        print(f"  merged SAM indices: {multiface['merged_from_indices']}")
+        print(
+            "  union fill ratio:   "
+            f"{multiface['merged_union_fill_ratio']:.3f}"
+        )
+        print(f"  area growth:        {multiface['merged_area_growth']:.3f}")
+        print(f"  merged score:       {multiface['score']:.3f}")
+
+        if selected is None or multiface["score"] > selected["score"]:
+            selected = multiface
 
     return selected
 

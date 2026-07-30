@@ -10,6 +10,38 @@ Each mode was extracted verbatim from a validated standalone script
 (`*_final.py` / `unified_detector_all_in_one.py`), with the module-level
 constants replaced by a config dataclass — behavior is unchanged.
 
+The `package` and `box` modes have since taken two mask-selection rules from the
+validated `product_detection_fix.py` / `box_detection_fix.py`, both aimed at
+angled boxes that SAM2 splits into separate faces (previously only half the box
+was detected):
+
+- **rotated split-mask merge** (`box_merge_rotated_*`) — a fallback pairing rule
+  for `build_merged_cardboard_box_candidate`. When two box fragments fail the
+  upright relationship (horizontal overlap / width ratio / centre-x / vertical
+  gap), they are still merged if their rotated rectangles share an angle
+  (`≤ 22°` apart) and sit close together. Rotated pairs must additionally fill
+  the completed rectangle (`≥ 0.42`) and not swallow the ROI (`≤ 0.78`).
+- **multi-face merge** (`box_multiface_*`) — joins a box-rule mask to a touching
+  package-rule mask through their convex hull, for angled boxes showing a top
+  and a side face as two separate masks. Contributes a new mask source,
+  `cardboard_box_multiface_merge`, which the type classifier treats as a box
+  (override reason `angled_box_multiface_merge`).
+
+Both are on by default and gated by `*_enable` fields, so setting
+`box_merge_rotated_enable: false` / `box_multiface_merge_enable: false` restores
+the previous selection behavior.
+
+Two details differ between the modes. In `package`, the multi-face partner is a
+mask that passed the general package rules; in `box` there is no such scorer, so
+`build_secondary_face_candidates` supplies partners using loose geometry-only
+gates (`secondary_face_*`) — a box's second face is usually too dark to pass the
+cardboard-colour rules. And `box` keeps its own two-axis
+`pair_fragment_compatibility` (top/bottom **and** left/right splits) plus
+`select_complete_single_box_candidate`, neither of which exists in the
+standalone fix scripts; the rotated rule was added as a third fallback rather
+than replacing them. Merged results carry `merged_geometry_mode`
+(`axis_aligned` / `rotated`) so the JSON shows which rule fired.
+
 ## Modes
 
 One camera/station = one mode. Pick a mode with `get_detector(mode)`.

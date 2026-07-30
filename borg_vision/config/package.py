@@ -100,6 +100,29 @@ class PackageConfig(BaseConfig):
     box_merge_min_result_rectangularity: float = 0.72
     box_merge_score_bonus: float = 0.85
 
+    # ----- rotated split-mask merge (angled boxes split along a seam) ---
+    # Fallback pairing rule for build_merged_cardboard_box_candidate: when a
+    # pair fails the upright (axis-aligned) relationship, accept it anyway if
+    # the two fragments share a rotation angle and sit close together.
+    box_merge_rotated_enable: bool = True
+    box_merge_rotated_max_center_distance_ratio: float = 1.35
+    box_merge_rotated_max_angle_diff_deg: float = 22.0
+    box_merge_rotated_min_completed_fill_ratio: float = 0.42
+    box_merge_rotated_max_completed_area_ratio: float = 0.78
+
+    # ----- multi-face merge (angled box showing top + side face) -------
+    # Joins a box-rule mask to a touching package-rule mask via their convex
+    # hull, for angled boxes where SAM segments each visible face separately.
+    box_multiface_merge_enable: bool = True
+    box_multiface_max_candidates: int = 16
+    box_multiface_touch_dilate_px: int = 28
+    box_multiface_max_pair_iou: float = 0.20
+    box_multiface_min_second_area_ratio: float = 0.025
+    box_multiface_min_area_growth: float = 1.25
+    box_multiface_min_union_fill_ratio: float = 0.58
+    box_multiface_max_hull_area_ratio: float = 0.72
+    box_multiface_score_bonus: float = 1.10
+
     # ----- segmentation box-type override / thin-polymailer veto -------
     box_type_segmentation_override_enable: bool = True
     box_type_segmentation_min_score: float = 5.25

@@ -1,0 +1,95 @@
+{
+  "timestamp": "20260730_105831",
+  "success": true,
+  "mode": "barcode_gate_package_detection",
+  "barcode": {
+    "type": "QRCODE",
+    "data": "RET001",
+    "rect": [
+      414,
+      359,
+      104,
+      104
+    ],
+    "decoded_count": 1
+  },
+  "package_type": "box",
+  "package_type_confidence_percent": 90,
+  "mask_source": "cardboard_box_multiface_merge",
+  "selected_mask_index": null,
+  "selected_mask_merged_from_indices": [
+    15,
+    1
+  ],
+  "selected_mask_score": 7.484,
+  "selected_mask_area_ratio": 0.242,
+  "selected_mask_rectangularity": 0.597,
+  "selected_mask_aspect_ratio": 1.02,
+  "selected_mask_color_score": 0.866,
+  "selected_mask_selection_override": "full_box_override",
+  "dedicated_box_sam_enabled": true,
+  "dedicated_box_mask_count": 71,
+  "dedicated_box_candidate_found": true,
+  "top_face_depth_mm": 576,
+  "package_depth_mm": 119,
+  "length_mm": 210.844,
+  "width_mm": 207.784,
+  "angle_deg": -66.038,
+  "center_x_mm": -6.742,
+  "center_y_mm": 8.584,
+  "product_inside_found": false,
+  "product_inside_center_x_mm": null,
+  "product_inside_center_y_mm": null,
+  "product_inside_center_pixel_u": null,
+  "product_inside_center_pixel_v": null,
+  "product_inside_depth_mm": null,
+  "product_inside_debug": {
+    "reason": "not_polymailer",
+    "area_px": 0,
+    "area_ratio_of_package": 0
+  },
+  "size_scale": 1.04,
+  "base_depth_mm": 695,
+  "measurement_depth_offset_mm": 10,
+  "top_face_depth_debug": {
+    "raw_distance_mm": 566,
+    "offset_distance_mm": 576,
+    "depth_count": 41387,
+    "sample_count_total": 44316,
+    "mean_depth_mm": 576.389,
+    "min_depth_mm": 569
+  },
+  "depth_classification_debug": {
+    "segmentation_box_override": true,
+    "segmentation_box_override_reason": "angled_box_multiface_merge",
+    "segmentation_box_override_vetoed": false,
+    "segmentation_box_override_veto_reason": null,
+    "depth_classifier_type_before_override": "polymailer",
+    "depth_classifier_confidence_before_override": 0.93,
+    "package_depth_mm_for_type": 119,
+    "box_score": 0.07,
+    "raw_box_score": 0.15,
+    "poly_signal_count": 3,
+    "poly_signature_score": 0.825,
+    "plane_residual_std_mm": 118.445,
+    "plane_residual_range_mm": 206.65,
+    "center_edge_depth_delta_mm": null,
+    "valid_points": 966,
+    "valid_fraction_on_mask": 0.008
+  },
+  "camera": {
+    "rgb_size": [
+      1280,
+      720
+    ],
+    "classification_depth_size": [
+      1280,
+      720
+    ],
+    "measurement_stereo_size": [
+      640,
+      400
+    ],
+    "fps": 20
+  }
+}
