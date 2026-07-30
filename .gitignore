@@ -10,3 +10,5 @@ outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
 .cache/
+cardboard_box_depth_results/
+package_barcode_detection_results/
