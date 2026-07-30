@@ -10,6 +10,11 @@ Each mode was extracted verbatim from a validated standalone script
 (`*_final.py` / `unified_detector_all_in_one.py`), with the module-level
 constants replaced by a config dataclass — behavior is unchanged.
 
+SAM 2 is class-agnostic, so every mode is really a set of hand-written
+heuristics that turn its unlabelled mask proposals into one selected object
+mask. Those are documented in [SEGMENTATION_RULES.md](SEGMENTATION_RULES.md) —
+read it before tuning any threshold.
+
 ## Modes
 
 One camera/station = one mode. Pick a mode with `get_detector(mode)`.
@@ -31,18 +36,21 @@ One camera/station = one mode. Pick a mode with `get_detector(mode)`.
 
 ```
 borg_vision/
+  SEGMENTATION_RULES.md  every gate/score/repair rule + threshold, per mode
   config/        BaseConfig + per-mode configs (PackageConfig, BoxConfig, ...,
                  InspectionConfig — standalone, no SAM2/depth fields)
   camera.py      OakCamera + Frames (depthai v3 pipeline, depth->RGB alignment)
   barcode.py     pyzbar barcode detection + overlay
   inspection.py  OpenAI inspection logic (prompt, image optimize, API call)
   detection/     per-mode pure detection logic (run_sam2_* entry points)
+                 + masks.py (mask primitives shared by more than one mode)
   visualization/ common.py + per-mode overlays/heatmaps/JSON
   results.py     BaseResult + per-mode result dataclasses (+ InspectionResult)
   detectors/     BaseDetector + per-mode detectors (+ InspectionDetector)
   registry.py    get_detector(mode, ...) factory + get_inspection_detector()
                  + available_modes()
   cli/           run.py (generic runner) + product_detection.py (interactive)
+                 + eval_masks.py (offline batch mask eval + viewer)
                  + inspection.py (dual-camera / offline inspection runner)
   __main__.py    `python -m borg_vision`
 ```
@@ -148,6 +156,45 @@ SPACE/q barcode-gated preview loop:
 ```bash
 python -m borg_vision.cli.product_detection
 ```
+
+### Offline mask evaluation (no camera)
+
+Run a mode's segmentation rules over a tree of images, then flip through the
+results with the arrow keys. This is the fastest way to check a rule change
+against real frames before going to the robot.
+
+```bash
+export BORG_VISION_DATA=~/borg-data/sam2_vision_data
+
+# 1. batch over every image found recursively
+python -m borg_vision.cli.eval_masks --mode package --out /tmp/run_new
+
+# 2. browse the overlays: Left/Right arrows, worst-first
+python -m borg_vision.cli.eval_masks --view /tmp/run_new --sort iou
+
+# 3. A/B two revisions of the rules (run 1 on each, then diff)
+python -m borg_vision.cli.eval_masks --mode package --out /tmp/run_new \
+    --compare /tmp/run_old
+python -m borg_vision.cli.eval_masks --view /tmp/run_new --sort changed
+```
+
+Works for all five SAM2 modes (`--mode package|box|object|polymailer|clear_bag`).
+Discovery is recursive with `--glob` (repeatable, default `**/*.jpg,jpeg,png`)
+and skips saved artifacts — masks, overlays, heatmaps — so pointing it at a
+capture tree does not feed outputs back in. Narrow it with e.g.
+`--glob '**/package/*/raw_rgb.jpg'`.
+
+A run directory holds `overlay/` (ROI with the mask outlined), `json/` (one
+record per image), `summary.csv` and contact sheets. Where a capture directory
+also contains the mask the deployed code chose (`package_mask.png` next to
+`raw_rgb.jpg`), it is drawn **green** against this run's **red** and scored as
+IoU — a reference, not ground truth: if a rule just fixed a case the old code got
+wrong, a *low* IoU is the improvement.
+
+Only the RGB half of the pipeline runs (SAM2 on the ROI → the mode's
+gate/score/repair rules). Depth-derived outputs — dimensions, face depth,
+box-vs-polymailer type, product-inside, the clear-bag outline, and therefore
+`base_depth_mm` — are **not** covered and still need the camera.
 
 ## Inspection mode (dual-camera + OpenAI)
 
