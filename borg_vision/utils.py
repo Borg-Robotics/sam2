@@ -18,6 +18,19 @@ def _long_axis_angle_deg(w_px, h_px, angle_deg):
     return float(angle_deg)
 
 
+def long_axis_angle_diff_deg(angle_a, angle_b):
+    """Smallest angle between two long-axis directions (180-periodic).
+
+    Both inputs must ALREADY be normalized by _long_axis_angle_deg -- i.e. the
+    `angle_deg` field of get_rotated_box_from_mask(). Do not re-apply the
+    h_px > w_px -> +90 deg swap before calling this: the standalone scripts nest
+    their own normalized_rect_angle() only because their
+    get_rotated_box_from_mask returns the raw cv2.minAreaRect angle.
+    """
+    diff = abs(float(angle_a) - float(angle_b)) % 180.0
+    return float(min(diff, 180.0 - diff))
+
+
 def json_number(value):
     if value is None:
         return None

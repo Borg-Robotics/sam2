@@ -16,7 +16,7 @@ from .base import BaseConfig
 class PackageConfig(BaseConfig):
     save_dir: str = "package_barcode_detection_results"
 
-    base_depth_mm: float = 695.0
+    base_depth_mm: float = 700.0
     package_size_scale: float = 1.04
 
     barcode_decode_upscale: float = 2.0
@@ -99,6 +99,36 @@ class PackageConfig(BaseConfig):
     box_merge_min_area_growth_over_largest: float = 1.20
     box_merge_min_result_rectangularity: float = 0.72
     box_merge_score_bonus: float = 0.85
+
+    # ----- rotated-pair fallback for the split-mask merge ---------------
+    # An angled box splits into fragments whose bboxes fail every axis-aligned
+    # test, so fall back to comparing min-area-rect long axes. The two
+    # completed-rectangle gates apply to this path only.
+    box_merge_rotated_enable: bool = True
+    box_merge_rotated_max_center_distance_ratio: float = 1.35
+    box_merge_rotated_max_angle_diff_deg: float = 22.0
+    box_merge_rotated_min_completed_fill_ratio: float = 0.42
+    box_merge_rotated_max_completed_area_ratio: float = 0.78
+
+    # ----- multi-face merge (angled box showing two faces) -------------
+    # SAM segments each face separately when they differ in brightness, so the
+    # top face alone scores as a small box. Join a box face with an adjacent
+    # package candidate and keep the convex hull of the union.
+    box_multiface_merge_enable: bool = True
+    box_multiface_max_candidates: int = 16
+    box_multiface_touch_dilate_px: int = 28
+    box_multiface_max_pair_iou: float = 0.20
+    box_multiface_min_second_area_ratio: float = 0.025
+    box_multiface_min_area_growth: float = 1.25
+    # 0.90, not the 0.58 of product_detection_fix.py. Replaying 46 recorded
+    # package frames showed 0.58 lets the convex hull spike out along a conveyor
+    # roller: 5 frames regressed (union fill 0.684-0.870) while the 4 genuine
+    # angled-box repairs all sat at 0.938-0.985, so 0.90 separates them cleanly.
+    # Box mode keeps 0.58 -- it rescores the hull with the stricter box rules
+    # (rectangularity >= 0.35, aspect <= 4.0) and showed no regression.
+    box_multiface_min_union_fill_ratio: float = 0.90
+    box_multiface_max_hull_area_ratio: float = 0.72
+    box_multiface_score_bonus: float = 1.10
 
     # ----- segmentation box-type override / thin-polymailer veto -------
     box_type_segmentation_override_enable: bool = True

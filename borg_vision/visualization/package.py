@@ -253,7 +253,7 @@ def make_json_result(cfg, result, timestamp):
     return {
         "timestamp": timestamp,
         "success": True,
-        "mode": "barcode_gate_package_detection",
+        "mode": "barcode_gate_package_detection_balanced_box_poly_type_override",
         "barcode": {
             "type": barcode["type"] if barcode is not None else None,
             "data": barcode["data"] if barcode is not None else None,
@@ -280,6 +280,7 @@ def make_json_result(cfg, result, timestamp):
         "dedicated_box_candidate_found": bool(
             result.get("dedicated_box_candidate_found", False)
         ),
+        "exact_box_rules_roi": [cfg.roi_x1, cfg.roi_y1, cfg.roi_x2, cfg.roi_y2],
         "top_face_depth_mm": json_number(final_output["top_face_depth_mm"]),
         "package_depth_mm": json_number(final_output["package_depth_mm"]),
         "length_mm": json_number(final_output["length_mm"]),

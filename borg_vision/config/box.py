@@ -81,4 +81,37 @@ class BoxConfig(BaseConfig):
     box_merge_min_result_rectangularity: float = 0.72
     box_merge_score_bonus: float = 0.85
 
+    # Rotated-pair fallback for the split-mask repair: an angled box splits into
+    # fragments whose bboxes fail every axis-aligned test, so fall back to
+    # comparing min-area-rect long axes. The two completed-rectangle gates apply
+    # to this path only -- without them a rotated pair could bridge unrelated
+    # blobs, which the axis-aligned geometry already rules out.
+    box_merge_rotated_enable: bool = True
+    box_merge_rotated_max_center_distance_ratio: float = 1.35
+    box_merge_rotated_max_angle_diff_deg: float = 22.0
+    box_merge_rotated_min_completed_fill_ratio: float = 0.42
+    box_merge_rotated_max_completed_area_ratio: float = 0.78
+
+    # Multi-face merge: an angled box shows two faces at different brightness,
+    # so SAM segments each separately and the top face alone scores as a small
+    # box. Join a scoring box face with an adjacent second face and keep the
+    # convex hull of the union (not a min-area rectangle).
+    box_multiface_merge_enable: bool = True
+    box_multiface_max_candidates: int = 16
+    box_multiface_touch_dilate_px: int = 28
+    box_multiface_max_pair_iou: float = 0.20
+    box_multiface_min_second_area_ratio: float = 0.025
+    box_multiface_min_area_growth: float = 1.25
+    box_multiface_min_union_fill_ratio: float = 0.58
+    box_multiface_max_hull_area_ratio: float = 0.72
+    box_multiface_score_bonus: float = 1.10
+
+    # Loose secondary-face pool feeding the multi-face merge. Box mode only:
+    # package mode reuses its own package candidates instead. No HSV /
+    # min_box_value gate here on purpose -- a shaded side face is not brown.
+    secondary_face_max_area_ratio: float = 0.70
+    secondary_face_min_rectangularity: float = 0.08
+    secondary_face_max_aspect_ratio: float = 10.0
+    secondary_face_min_center_score: float = 0.12
+
     debug_print_masks: bool = False
