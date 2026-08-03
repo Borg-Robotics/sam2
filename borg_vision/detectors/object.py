@@ -38,6 +38,7 @@ class ObjectDetector(BaseDetector):
             frames.rgb,
             frames.depth_class_aligned,
             self._mask_generator,
+            self.camera.intrinsics,
         )
 
         if raw is None:

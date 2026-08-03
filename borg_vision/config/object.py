@@ -23,7 +23,7 @@ class ObjectConfig(BaseConfig):
 
     # Locked ROI (from the polymailer/object script).
     roi_x1: int = 330
-    roi_y1: int = 60
+    roi_y1: int = 30
     roi_x2: int = 940
     roi_y2: int = 700
 
@@ -52,7 +52,13 @@ class ObjectConfig(BaseConfig):
     use_convex_hull: bool = True
     mask_close_kernel_px: int = 25
     mask_close_iterations: int = 2
-    max_cleaned_area_growth: float = 2.8
+    # Cap on how much mask cleanup (close + convex hull) may grow a mask. At
+    # 2.8 the hull was free to bridge an object to whatever it sits on -- a box
+    # on a pedestal came back as one 1.48x-inflated mask, which then outscored
+    # the correct one because area_score rewards being closer to
+    # target_area_ratio. 1.2 still allows the hull to fill small holes in a
+    # mask but rejects it once it balloons.
+    max_cleaned_area_growth: float = 1.2
 
     # Scoring weights.
     center_score_weight: float = 1.4

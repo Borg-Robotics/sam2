@@ -72,6 +72,11 @@ class ObjectResult(BaseResult):
     center_pixel_v: Optional[int] = None
     distance_mm: Optional[float] = None
     depth_count: int = 0
+    # Long-axis rotation of the object mask, wrapped into (-90, 90].
+    angle_deg: Optional[float] = None
+    # Object center in the camera frame (x right, y down); z is distance_mm.
+    center_x_mm: Optional[float] = None
+    center_y_mm: Optional[float] = None
 
     @classmethod
     def from_raw(cls, raw, frames):

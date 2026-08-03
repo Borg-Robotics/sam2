@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 import torch
 
+from .package import get_rotated_box_from_mask, pixel_to_camera_xy_mm
+
 
 def mask_touches_roi_border(mask, margin_px):
     h, w = mask.shape[:2]
@@ -114,6 +116,21 @@ def get_mask_center(mask):
     cy = int(moments["m01"] / moments["m00"])
 
     return cx, cy
+
+
+def object_rotation_deg(obj):
+    """Long-axis rotation of the object mask in degrees, or None when the
+    rectangle fit fails.
+
+    Same convention as every other mode: the long axis of the minimum-area
+    rectangle.
+    """
+    rotated = get_rotated_box_from_mask(obj["mask"])
+
+    if rotated is None:
+        return None
+
+    return float(rotated["angle_deg"])
 
 
 def center_depth_mm(cfg, depth_roi, mask, center_roi):
@@ -253,9 +270,19 @@ def choose_best_object_mask(cfg, masks, roi_rgb):
     return best
 
 
-def run_sam2_object_segmentation(cfg, frame_bgr, depth_aligned, mask_generator):
+def run_sam2_object_segmentation(
+    cfg,
+    frame_bgr,
+    depth_aligned,
+    mask_generator,
+    intrinsics=None,
+):
     """Run SAM2 on the ROI, pick the best object mask, and measure its center
-    depth. Returns a result dict or None when no valid mask is found."""
+    depth. Returns a result dict or None when no valid mask is found.
+
+    With intrinsics the center is also projected into camera-frame millimetres
+    (x right, y down, z = the measured distance); without them center_x_mm and
+    center_y_mm come back None."""
     full_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     roi_rgb = full_rgb[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2].copy()
@@ -281,6 +308,14 @@ def run_sam2_object_segmentation(cfg, frame_bgr, depth_aligned, mask_generator):
         obj["center_roi"],
     )
 
+    angle_deg = object_rotation_deg(obj)
+
+    center_x_mm, center_y_mm = pixel_to_camera_xy_mm(
+        center_full,
+        distance_mm,
+        intrinsics,
+    )
+
     return {
         "roi_rgb": roi_rgb,
         "depth_roi": depth_roi,
@@ -288,6 +323,9 @@ def run_sam2_object_segmentation(cfg, frame_bgr, depth_aligned, mask_generator):
         "center_full": center_full,
         "distance_mm": distance_mm,
         "depth_count": depth_count,
+        "angle_deg": angle_deg,
+        "center_x_mm": center_x_mm,
+        "center_y_mm": center_y_mm,
         # Convenience scalars exposed in final_output for the result dataclass.
         "final_output": {
             "center_pixel_u": int(center_full[0]),
@@ -296,5 +334,8 @@ def run_sam2_object_segmentation(cfg, frame_bgr, depth_aligned, mask_generator):
                 float(distance_mm) if distance_mm is not None else None
             ),
             "depth_count": int(depth_count),
+            "angle_deg": angle_deg,
+            "center_x_mm": center_x_mm,
+            "center_y_mm": center_y_mm,
         },
     }

@@ -7,6 +7,7 @@ Ported verbatim from run_object()/object_detection_final.py; shared helpers
 import cv2
 import numpy as np
 
+from ..utils import fmt3, json_number
 from .common import make_depth_vis
 
 
@@ -66,6 +67,9 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
     lines = [
         "OBJECT SEGMENT + DEPTH",
         distance_text,
+        f"angle_deg={fmt3(result.get('angle_deg'))}",
+        f"center_xy_mm=({fmt3(result.get('center_x_mm'))}, "
+        f"{fmt3(result.get('center_y_mm'))})",
         f"center=({cx},{cy})",
         f"depth_count={result['depth_count']}",
         f"score={obj['score']:.2f}",
@@ -108,6 +112,9 @@ def make_json_result(cfg, result, timestamp):
             else None
         ),
         "depth_count": int(result["depth_count"]),
+        "angle_deg": json_number(result.get("angle_deg")),
+        "center_x_mm": json_number(result.get("center_x_mm")),
+        "center_y_mm": json_number(result.get("center_y_mm")),
         "roi": {
             "x1": cfg.roi_x1,
             "y1": cfg.roi_y1,
