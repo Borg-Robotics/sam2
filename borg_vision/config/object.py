@@ -21,6 +21,12 @@ class ObjectConfig(BaseConfig):
     # Single full-res stereo; center depth comes from the classification depth.
     needs_measurement_stereo: bool = False
 
+    # Distance to the base surface, used for height_mm. Object mode inherited
+    # 695.0 from BaseConfig, but the tray this rig measures against sits at
+    # 705.0 (measured median over the surface, and what box/polymailer/
+    # clear_bag already use); the old value under-reported every height by 10mm.
+    base_depth_mm: float = 705.0
+
     # Locked ROI (from the polymailer/object script).
     roi_x1: int = 330
     roi_y1: int = 30

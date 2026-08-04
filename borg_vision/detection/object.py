@@ -118,19 +118,46 @@ def get_mask_center(mask):
     return cx, cy
 
 
-def object_rotation_deg(obj):
-    """Long-axis rotation of the object mask in degrees, or None when the
-    rectangle fit fails.
+def estimate_object_dimensions_mm(cfg, obj, depth_mm, intrinsics):
+    """Object footprint and height in millimetres.
 
-    Same convention as every other mode: the long axis of the minimum-area
-    rectangle.
+    Mirrors the box mode: length/width are the sides of the minimum-area
+    rectangle scaled from pixels using the measured face depth, and height is
+    how far the face stands above the base surface (cfg.base_depth_mm).
+    angle_deg comes from the same rectangle fit, so it always describes the
+    same edge as `length`.
     """
+    empty = {
+        "length_mm": None,
+        "width_mm": None,
+        "height_mm": None,
+        "angle_deg": None,
+    }
+
     rotated = get_rotated_box_from_mask(obj["mask"])
 
     if rotated is None:
-        return None
+        return empty
 
-    return float(rotated["angle_deg"])
+    angle_deg = float(rotated["angle_deg"])
+
+    if depth_mm is None or intrinsics is None:
+        return {**empty, "angle_deg": angle_deg}
+
+    width_mm = (rotated["width_px"] * depth_mm) / intrinsics["fx"]
+    height_px_mm = (rotated["height_px"] * depth_mm) / intrinsics["fy"]
+
+    height_mm = cfg.base_depth_mm - depth_mm
+
+    if height_mm < 0:
+        height_mm = 0.0
+
+    return {
+        "length_mm": float(max(width_mm, height_px_mm)),
+        "width_mm": float(min(width_mm, height_px_mm)),
+        "height_mm": float(height_mm),
+        "angle_deg": angle_deg,
+    }
 
 
 def center_depth_mm(cfg, depth_roi, mask, center_roi):
@@ -308,7 +335,13 @@ def run_sam2_object_segmentation(
         obj["center_roi"],
     )
 
-    angle_deg = object_rotation_deg(obj)
+    dimensions = estimate_object_dimensions_mm(
+        cfg,
+        obj,
+        distance_mm,
+        intrinsics,
+    )
+    angle_deg = dimensions["angle_deg"]
 
     center_x_mm, center_y_mm = pixel_to_camera_xy_mm(
         center_full,
@@ -326,6 +359,7 @@ def run_sam2_object_segmentation(
         "angle_deg": angle_deg,
         "center_x_mm": center_x_mm,
         "center_y_mm": center_y_mm,
+        "dimensions": dimensions,
         # Convenience scalars exposed in final_output for the result dataclass.
         "final_output": {
             "center_pixel_u": int(center_full[0]),
@@ -337,5 +371,8 @@ def run_sam2_object_segmentation(
             "angle_deg": angle_deg,
             "center_x_mm": center_x_mm,
             "center_y_mm": center_y_mm,
+            "length_mm": dimensions["length_mm"],
+            "width_mm": dimensions["width_mm"],
+            "height_mm": dimensions["height_mm"],
         },
     }

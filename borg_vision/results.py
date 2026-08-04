@@ -77,6 +77,10 @@ class ObjectResult(BaseResult):
     # Object center in the camera frame (x right, y down); z is distance_mm.
     center_x_mm: Optional[float] = None
     center_y_mm: Optional[float] = None
+    # Footprint from the rotated rect; height is above cfg.base_depth_mm.
+    length_mm: Optional[float] = None
+    width_mm: Optional[float] = None
+    height_mm: Optional[float] = None
 
     @classmethod
     def from_raw(cls, raw, frames):

@@ -11,24 +11,27 @@ from ..utils import fmt3, json_number
 from .common import make_depth_vis
 
 
-def draw_result(cfg, frame_bgr, depth_aligned, result):
-    result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    depth_vis = make_depth_vis(cfg, depth_aligned)
+def draw_object_outline(cfg, result_rgb, depth_vis, obj):
+    """Trace the object's actual silhouette.
 
-    roi_rgb = result["roi_rgb"].copy()
+    Follows the mask contour rather than a bounding box, so the outline sits on
+    the object's real edges. Falls back to the axis-aligned bbox if the mask
+    yields no contour.
+    """
+    contours, _ = cv2.findContours(
+        obj["mask"].astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
 
-    obj = result["object"]
-    mask = obj["mask"]
+    if contours:
+        # Mask coordinates are ROI-relative; shift them into the full frame.
+        outline = max(contours, key=cv2.contourArea) + [cfg.roi_x1, cfg.roi_y1]
 
-    roi_rgb[mask == 1] = (
-        0.50 * roi_rgb[mask == 1]
-        + 0.50 * np.array([0, 255, 0])
-    ).astype(np.uint8)
+        cv2.polylines(result_rgb, [outline], True, (0, 255, 0), 3)
+        cv2.polylines(depth_vis, [outline], True, (0, 255, 0), 3)
 
-    result_rgb[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2] = roi_rgb
-
-    cv2.rectangle(result_rgb, (cfg.roi_x1, cfg.roi_y1), (cfg.roi_x2, cfg.roi_y2), (0, 255, 255), 3)
-    cv2.rectangle(depth_vis, (cfg.roi_x1, cfg.roi_y1), (cfg.roi_x2, cfg.roi_y2), (0, 255, 255), 3)
+        return
 
     x, y, w, h = obj["bbox"]
 
@@ -48,6 +51,28 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         3,
     )
 
+
+def draw_result(cfg, frame_bgr, depth_aligned, result):
+    result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    depth_vis = make_depth_vis(cfg, depth_aligned)
+
+    roi_rgb = result["roi_rgb"].copy()
+
+    obj = result["object"]
+    mask = obj["mask"]
+
+    roi_rgb[mask == 1] = (
+        0.50 * roi_rgb[mask == 1]
+        + 0.50 * np.array([0, 255, 0])
+    ).astype(np.uint8)
+
+    result_rgb[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2] = roi_rgb
+
+    cv2.rectangle(result_rgb, (cfg.roi_x1, cfg.roi_y1), (cfg.roi_x2, cfg.roi_y2), (0, 255, 255), 3)
+    cv2.rectangle(depth_vis, (cfg.roi_x1, cfg.roi_y1), (cfg.roi_x2, cfg.roi_y2), (0, 255, 255), 3)
+
+    draw_object_outline(cfg, result_rgb, depth_vis, obj)
+
     cx, cy = result["center_full"]
 
     cv2.circle(result_rgb, (cx, cy), 8, (255, 255, 0), -1)
@@ -64,9 +89,14 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         else f"center_distance={distance_mm:.1f}mm"
     )
 
+    dimensions = result.get("dimensions") or {}
+
     lines = [
         "OBJECT SEGMENT + DEPTH",
         distance_text,
+        f"length_mm={fmt3(dimensions.get('length_mm'))}",
+        f"width_mm={fmt3(dimensions.get('width_mm'))}",
+        f"height_mm={fmt3(dimensions.get('height_mm'))}",
         f"angle_deg={fmt3(result.get('angle_deg'))}",
         f"center_xy_mm=({fmt3(result.get('center_x_mm'))}, "
         f"{fmt3(result.get('center_y_mm'))})",
@@ -98,6 +128,7 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
 
 def make_json_result(cfg, result, timestamp):
     obj = result["object"]
+    dimensions = result.get("dimensions") or {}
 
     return {
         "timestamp": timestamp,
@@ -115,6 +146,9 @@ def make_json_result(cfg, result, timestamp):
         "angle_deg": json_number(result.get("angle_deg")),
         "center_x_mm": json_number(result.get("center_x_mm")),
         "center_y_mm": json_number(result.get("center_y_mm")),
+        "length_mm": json_number(dimensions.get("length_mm")),
+        "width_mm": json_number(dimensions.get("width_mm")),
+        "height_mm": json_number(dimensions.get("height_mm")),
         "roi": {
             "x1": cfg.roi_x1,
             "y1": cfg.roi_y1,
