@@ -94,7 +94,24 @@ class BoxConfig(BaseConfig):
     # ----- multi-face merge (angled box showing top + side face) -------
     # Joins a box-rule mask to a touching secondary-face mask via their
     # convex hull, for angled boxes where SAM segments each face separately.
-    box_multiface_merge_enable: bool = True
+    #
+    # DEFAULT OFF (2026-08-10). On the return station this path absorbed the box
+    # grasp mechanism's tray as a "secondary face" and reported it instead of the
+    # box -- 307 x 257 mm rather than the true 200 x 196 mm. It wins because it
+    # adds box_multiface_score_bonus (1.10, the largest bonus of any construction
+    # path) and because secondary_face_min_rectangularity is only 0.08, so a large
+    # rectangle sitting against the box qualifies as a face of it.
+    #
+    # SAM2 is not at fault: on a failing frame its generator produced 62 masks
+    # whose best-scoring candidate WAS the cardboard (score 6.554, area 0.268,
+    # IoU 0.984 vs the true box). The tray mask is absent from those raw outputs
+    # -- this path constructs it.
+    #
+    # Cost of the default: an angled box showing two faces now measures only its
+    # top face. Re-enable per camera via the vision_cameras.yaml mode overrides
+    # where that geometry actually occurs, or tighten
+    # secondary_face_min_rectangularity first.
+    box_multiface_merge_enable: bool = False
     box_multiface_max_candidates: int = 16
     box_multiface_touch_dilate_px: int = 28
     box_multiface_max_pair_iou: float = 0.20

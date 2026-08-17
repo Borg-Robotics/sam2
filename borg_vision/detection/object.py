@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from .package import get_rotated_box_from_mask, pixel_to_camera_xy_mm
+from .polymailer import _patch_plane
 
 
 def mask_touches_roi_border(mask, margin_px):
@@ -297,6 +298,135 @@ def choose_best_object_mask(cfg, masks, roi_rgb):
     return best
 
 
+
+def score_object_grasp_candidates(
+    cfg,
+    obj,
+    center_roi,
+    depth_roi,
+    distance_mm,
+    dimensions,
+    intrinsics,
+):
+    """Rank suction-cup grasp points on a detected object, centred on its centroid.
+
+    The centroid is the right answer most of the time, so the search is anchored
+    there and `obj_grasp_w_centre` pulls candidates back toward it. What the
+    scoring buys is a ranked fallback for when the centroid happens to land on a
+    crease, a label edge or a curved shoulder -- a failed grasp there otherwise
+    has nowhere to retry.
+
+    Scored per candidate over a disc the size of the real cup:
+      - plane-fit RMS residual -> roughness
+      - plane tilt             -> how askew a straight-down cup would land
+      - distance from the centroid -> stay put unless the surface says move
+      - distance from the mask edge -> prefer the cup fully supported
+
+    No bulge term: unlike a polymailer there is no product-inside mask here.
+
+    Returns candidates best-first with camera-frame x/y/z in mm, plus the raw
+    terms so a caller can see why something ranked where it did. Empty when the
+    object is too small for the cup or depth was too sparse to fit a plane --
+    the caller reports that as not-scored rather than as a failure.
+    """
+    mask = (obj["mask"] > 0).astype(np.uint8)
+    if mask.sum() == 0 or center_roi is None:
+        return []
+
+    # Pixel scale straight from the intrinsics at the measured depth: one pixel
+    # spans depth/fx mm across. The polymailer scorer derives this from its edge
+    # span instead, because a floppy mailer's own measured length is the more
+    # trustworthy ruler there; here the object is rigid and the intrinsics are
+    # exact. fx and fy differ slightly, so the tighter of the two is used -- it
+    # makes the cup footprint conservative rather than optimistic.
+    if distance_mm is None or intrinsics is None:
+        return []
+    fx, fy = intrinsics.get("fx"), intrinsics.get("fy")
+    if not fx or not fy:
+        return []
+    mm_per_px = float(distance_mm) / float(max(fx, fy))
+    if mm_per_px <= 0:
+        return []
+
+    radius_px = max(int(round((cfg.obj_grasp_cup_diameter_mm / 2.0) / mm_per_px)), 3)
+    margin_px = int(round(cfg.obj_grasp_edge_margin_mm / mm_per_px))
+    max_offset_px = cfg.obj_grasp_max_offset_mm / mm_per_px
+
+    d_edge = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    nx, ny = int(center_roi[0]), int(center_roi[1])
+
+    h, w = mask.shape
+    step = max(cfg.obj_grasp_grid_step_px, 1)
+    cands = []
+    for y in range(radius_px, h - radius_px, step):
+        for x in range(radius_px, w - radius_px, step):
+            if d_edge[y, x] < radius_px + margin_px:
+                continue                      # cup would overhang the object
+            offset = float(np.hypot(x - nx, y - ny))
+            if offset > max_offset_px:
+                continue
+            rms, tilt, count = _patch_plane(
+                cfg, depth_roi, x, y, radius_px,
+                min_valid_px=cfg.obj_grasp_min_valid_px,
+                min_valid_frac=cfg.obj_grasp_min_valid_frac,
+                min_depth_levels=cfg.obj_grasp_min_depth_levels)
+            if rms is None:
+                continue
+            cands.append({
+                "x_roi": x, "y_roi": y, "rms_mm": rms, "tilt_deg": tilt,
+                "valid_px": count, "offset_mm": offset * mm_per_px,
+                "edge_dist_px": float(d_edge[y, x]),
+            })
+
+    if not cands:
+        return []
+
+    def norm(key, invert):
+        v = np.array([c[key] for c in cands], dtype=np.float32)
+        lo, hi = v.min(), v.max()
+        if hi - lo < 1e-6:
+            return np.full_like(v, 0.5)
+        s = (v - lo) / (hi - lo)
+        return 1.0 - s if invert else s
+
+    s_rms = norm("rms_mm", True)
+    s_tilt = norm("tilt_deg", True)
+    s_offset = norm("offset_mm", True)
+    s_edge = norm("edge_dist_px", False)
+
+    for i, c in enumerate(cands):
+        c["score"] = float(
+            cfg.obj_grasp_w_rough * s_rms[i]
+            + cfg.obj_grasp_w_tilt * s_tilt[i]
+            + cfg.obj_grasp_w_centre * s_offset[i]
+            + cfg.obj_grasp_w_edge * s_edge[i]
+        )
+
+    cands.sort(key=lambda c: -c["score"])
+
+    # Non-max suppression, so the list is genuinely alternative spots rather than
+    # a cluster of neighbouring pixels that would all fail the same way.
+    kept = []
+    min_sep = radius_px * 2
+    for c in cands:
+        if all((c["x_roi"] - k["x_roi"]) ** 2 + (c["y_roi"] - k["y_roi"]) ** 2
+               > min_sep * min_sep for k in kept):
+            kept.append(c)
+        if len(kept) >= cfg.obj_grasp_max_candidates:
+            break
+
+    for c in kept:
+        full = (c["x_roi"] + cfg.roi_x1, c["y_roi"] + cfg.roi_y1)
+        depth, _ = center_depth_mm(cfg, depth_roi, obj["mask"], (c["x_roi"], c["y_roi"]))
+        if depth is None:
+            depth = distance_mm
+        x_mm, y_mm = pixel_to_camera_xy_mm(full, depth, intrinsics)
+        c["x_mm"], c["y_mm"], c["z_mm"] = x_mm, y_mm, depth
+        c["point_full"] = full
+
+    return kept
+
+
 def run_sam2_object_segmentation(
     cfg,
     frame_bgr,
@@ -349,6 +479,25 @@ def run_sam2_object_segmentation(
         intrinsics,
     )
 
+    # Suction-cup grasp. Best-first; empty when the object is too small for the
+    # cup or depth was too sparse to fit a plane, in which case the grasp point
+    # falls back to the object's centroid -- a small object is still pickable,
+    # the scorer just cannot vouch for the surface it lands on.
+    grasp_candidates = score_object_grasp_candidates(
+        cfg,
+        obj,
+        obj["center_roi"],
+        depth_roi,
+        distance_mm,
+        dimensions,
+        intrinsics,
+    )
+    best = grasp_candidates[0] if grasp_candidates else None
+    if best is not None:
+        grasp_x_mm, grasp_y_mm, grasp_z_mm = best["x_mm"], best["y_mm"], best["z_mm"]
+    else:
+        grasp_x_mm, grasp_y_mm, grasp_z_mm = center_x_mm, center_y_mm, distance_mm
+
     return {
         "roi_rgb": roi_rgb,
         "depth_roi": depth_roi,
@@ -360,6 +509,10 @@ def run_sam2_object_segmentation(
         "center_x_mm": center_x_mm,
         "center_y_mm": center_y_mm,
         "dimensions": dimensions,
+        "grasp_candidates": grasp_candidates,
+        "grasp_x_mm": grasp_x_mm,
+        "grasp_y_mm": grasp_y_mm,
+        "grasp_z_mm": grasp_z_mm,
         # Convenience scalars exposed in final_output for the result dataclass.
         "final_output": {
             "center_pixel_u": int(center_full[0]),
@@ -374,5 +527,9 @@ def run_sam2_object_segmentation(
             "length_mm": dimensions["length_mm"],
             "width_mm": dimensions["width_mm"],
             "height_mm": dimensions["height_mm"],
+            "grasp_x_mm": grasp_x_mm,
+            "grasp_y_mm": grasp_y_mm,
+            "grasp_z_mm": grasp_z_mm,
+            "grasp_candidates": grasp_candidates,
         },
     }

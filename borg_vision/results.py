@@ -82,6 +82,17 @@ class ObjectResult(BaseResult):
     width_mm: Optional[float] = None
     height_mm: Optional[float] = None
 
+    # THE point to pick at, centred on the object and checked for surface
+    # quality. Falls back to the bare centroid when the object is smaller than
+    # the cup or depth was too sparse to judge -- still usable, just unvouched.
+    grasp_x_mm: Optional[float] = None
+    grasp_y_mm: Optional[float] = None
+    grasp_z_mm: Optional[float] = None
+
+    # Three fallbacks to retry when the cup fails to seal, best first. Each
+    # entry: x_mm/y_mm/z_mm in the camera frame. Empty when nothing scored.
+    grasp_candidates: list = field(default_factory=list)
+
     @classmethod
     def from_raw(cls, raw, frames):
         return cls(raw=raw, frames=frames, **raw["final_output"])
@@ -147,6 +158,22 @@ class PolymailerResult(BaseResult):
     bottom_edge_x_mm: Optional[float] = None
     bottom_edge_y_mm: Optional[float] = None
     bottom_edge_z_mm: Optional[float] = None
+
+    # Release-grasp points: halfway from the polymailer center to each edge
+    # midpoint above.
+    # THE point to pick at. Chosen on the end OPPOSITE the cut, so the cup is
+    # never on the opening the product slides out of. Falls back to the mailer
+    # centre when nothing could be scored -- grasp_side says which happened.
+    grasp_x_mm: Optional[float] = None
+    grasp_y_mm: Optional[float] = None
+    grasp_z_mm: Optional[float] = None
+    # "bottom" or "top" -- which end was picked, derived from cut_side. None when
+    # no cut side could be chosen, in which case the point is a bare midpoint.
+    grasp_side: Optional[str] = None
+
+    # Two fallbacks to retry when the cup fails to seal, best first. Each entry:
+    # x_mm/y_mm/z_mm in the camera frame. Empty when nothing could be scored.
+    grasp_candidates: list = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw, frames):

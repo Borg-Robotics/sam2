@@ -264,6 +264,22 @@ The annotated `*.png` is a side-by-side of RGB + depth (+ heatmap for modes
 that produce one). `draw_result(result)` returns the same image in memory
 without writing to disk.
 
+### Diagnostics deliberately NOT in the JSON
+
+Three blocks used to be written into `object`'s JSON and were removed once it was
+confirmed nothing read them back. They were records of how a detection was set up
+and why it chose the mask it did — useful while tuning, noise afterwards. The
+values all still exist, just not in the result file:
+
+| Was in JSON | Where it lives now | What it told you |
+|---|---|---|
+| `roi` | `cfg.roi_x1/y1/x2/y2` | The crop SAM2 runs on. Every ROI-relative pixel has `roi_x1`/`roi_y1` added back to reach full-frame coordinates, so a wrong ROI shifts every measured point. |
+| `depth_alignment` | `cfg.depth_align_scale_x/y`, `cfg.depth_align_x_shift_px` | Stereo depth does not land on the RGB pixels; it is scaled ~1.25x and shifted before sampling (applied in `camera.py`). Check this first if depth looks offset from the image. |
+| `selected_mask` | the annotated PNG, and `result["object"]` in memory | Why one SAM2 mask beat the others: `score` (weighted total), `area_ratio`, `rectangularity`, `aspect_ratio`, `center_score`, `bbox_roi`. This is the block to reach for when segmentation grabs the wrong thing — a merged box+tray, or a mask that swallowed the surface underneath. |
+
+Re-add them to `visualization/object.py`'s `make_json_result` if a segmentation
+problem needs diagnosing; the underlying data never went away.
+
 `inspection` differs: the captured JPEGs (and their optimized copies) already
 live under `cfg.save_dir/<request_id>/camera_{1,2}/`; `save_debug(result)` adds
 `inspection_result.json` (the verdict, confidence, reasons, image paths). There

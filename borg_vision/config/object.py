@@ -74,3 +74,32 @@ class ObjectConfig(BaseConfig):
     sam_stability_score_weight: float = 0.5
 
     debug_print_masks: bool = False
+
+    # --- Suction-cup grasp scoring -----------------------------------------
+    # Where to put the cup on a detected object. The geometric centroid is the
+    # obvious answer and usually the right one, so the search is centred there
+    # and pulled back toward it -- but a centroid landing on a crease, a label
+    # edge or the shoulder of a curved face is a failed grasp with nothing to
+    # retry. Scoring a grid around it gives ranked alternatives.
+    #
+    # Ported from the polymailer scorer (poly_grasp_*), minus the bulge term:
+    # there is no product-inside mask for a generic object.
+    obj_grasp_cup_diameter_mm: float = 30.0
+    obj_grasp_edge_margin_mm: float = 5.0   # keep the cup this far inside the mask
+    obj_grasp_max_offset_mm: float = 40.0   # how far from the centroid to search
+    obj_grasp_grid_step_px: int = 6
+    obj_grasp_min_valid_px: int = 30
+    obj_grasp_min_valid_frac: float = 0.60
+    obj_grasp_min_depth_levels: int = 3
+    # The pick plus three retries: the scorer returns one ranked list with the
+    # pick at its head, so this is 1 + 3 and consumers are handed the tail.
+    obj_grasp_max_candidates: int = 4
+
+    # Scoring weights. Centre-biased by design: w_centre dominates so the pick
+    # stays at the centroid unless the surface there is measurably worse than a
+    # nearby alternative. Roughness is the next strongest -- it is what actually
+    # breaks a seal.
+    obj_grasp_w_rough: float = 0.35
+    obj_grasp_w_tilt: float = 0.15
+    obj_grasp_w_centre: float = 0.45
+    obj_grasp_w_edge: float = 0.05

@@ -81,6 +81,32 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
     cv2.circle(depth_vis, (cx, cy), 8, (0, 255, 255), -1)
     cv2.circle(depth_vis, (cx, cy), 16, (0, 255, 255), 2)
 
+    # The pick (rank 0, green) and its three retries (orange), so the debug
+    # image alone shows where the cup is going and what it would try next.
+    # The cup footprint is drawn at its real radius, which is what makes an
+    # overhanging or edge-hugging pick obvious at a glance.
+    for rank, cand in enumerate(result.get("grasp_candidates") or []):
+        point = cand.get("point_full")
+
+        if point is None:
+            continue
+
+        cx_c, cy_c = point
+        colour = (0, 255, 0) if rank == 0 else (0, 200, 255)
+        cv2.circle(result_rgb, (cx_c, cy_c), 4, colour, -1)
+        cv2.circle(result_rgb, (cx_c, cy_c), 22, colour, 2)
+        cv2.putText(
+            result_rgb,
+            "PICK" if rank == 0 else str(rank),
+            (cx_c + 26, cy_c + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            colour,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.circle(depth_vis, (cx_c, cy_c), 22, colour, 2)
+
     distance_mm = result["distance_mm"]
 
     distance_text = (
@@ -98,6 +124,8 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         f"width_mm={fmt3(dimensions.get('width_mm'))}",
         f"height_mm={fmt3(dimensions.get('height_mm'))}",
         f"angle_deg={fmt3(result.get('angle_deg'))}",
+        f"grasp xyz=({fmt3(result.get('grasp_x_mm'))}, "
+        f"{fmt3(result.get('grasp_y_mm'))}, {fmt3(result.get('grasp_z_mm'))})",
         f"center_xy_mm=({fmt3(result.get('center_x_mm'))}, "
         f"{fmt3(result.get('center_y_mm'))})",
         f"center=({cx},{cy})",
@@ -127,7 +155,6 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
 
 
 def make_json_result(cfg, result, timestamp):
-    obj = result["object"]
     dimensions = result.get("dimensions") or {}
 
     return {
@@ -149,25 +176,19 @@ def make_json_result(cfg, result, timestamp):
         "length_mm": json_number(dimensions.get("length_mm")),
         "width_mm": json_number(dimensions.get("width_mm")),
         "height_mm": json_number(dimensions.get("height_mm")),
-        "roi": {
-            "x1": cfg.roi_x1,
-            "y1": cfg.roi_y1,
-            "x2": cfg.roi_x2,
-            "y2": cfg.roi_y2,
-        },
-        "depth_alignment": {
-            "scale_x": cfg.depth_align_scale_x,
-            "scale_y": cfg.depth_align_scale_y,
-            "shift_x_px": cfg.depth_align_x_shift_px,
-            "shift_y_px": cfg.depth_align_y_shift_px,
-        },
-        "selected_mask": {
-            "index": int(obj["index"]),
-            "score": float(obj["score"]),
-            "area_ratio": float(obj["area_ratio"]),
-            "bbox_roi": [int(v) for v in obj["bbox"]],
-            "rectangularity": float(obj["rectangularity"]),
-            "aspect_ratio": float(obj["aspect_ratio"]),
-            "center_score": float(obj["center_score"]),
-        },
+        "grasp_x_mm": json_number(result.get("grasp_x_mm")),
+        "grasp_y_mm": json_number(result.get("grasp_y_mm")),
+        "grasp_z_mm": json_number(result.get("grasp_z_mm")),
+        "grasp_candidates": [
+            {
+                "x_mm": json_number(c.get("x_mm")),
+                "y_mm": json_number(c.get("y_mm")),
+                "z_mm": json_number(c.get("z_mm")),
+            }
+            # Retries only -- the list's head IS grasp_point, so it is dropped.
+            for c in (result.get("grasp_candidates") or [])[1:]
+        ],
+        # roi / depth_alignment / selected_mask deliberately omitted: nothing read
+        # them back and they are recoverable from cfg and the annotated PNG.
+        # See "Diagnostics deliberately NOT in the JSON" in the README.
     }

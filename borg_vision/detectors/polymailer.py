@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from ..config import PolymailerConfig
 from ..detection.polymailer import run_sam2_polymailer
@@ -84,12 +85,17 @@ class PolymailerDetector(BaseDetector):
         result_bgr = self._draw_result(result)
 
         raw_path = save_dir / artifact_name("raw_rgb", "jpg", timestamp, organized)
+        # Full-frame aligned depth, same as object mode saves. Needed offline to
+        # score candidate suction points for surface flatness -- the masks and RGB
+        # alone cannot tell a crease from printing.
+        depth_aligned_path = save_dir / artifact_name("depth_aligned", "npy", timestamp, organized)
         result_path = save_dir / artifact_name("polymailer_output", "png", timestamp, organized)
         poly_mask_path = save_dir / artifact_name("polymailer_mask", "png", timestamp, organized)
         product_mask_path = save_dir / artifact_name("product_bulge_mask", "png", timestamp, organized)
         json_path = save_dir / artifact_name("polymailer_output", "json", timestamp, organized)
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
+        np.save(str(depth_aligned_path), result.frames.depth_class_aligned)
         cv2.imwrite(str(result_path), result_bgr)
         save_binary_mask(poly_mask_path, result.raw["poly"]["mask"])
         save_binary_mask(product_mask_path, result.raw["product"]["mask"])
@@ -100,6 +106,7 @@ class PolymailerDetector(BaseDetector):
         return {
             "dir": save_dir,
             "raw_rgb": raw_path,
+            "depth_aligned": depth_aligned_path,
             "result": result_path,
             "poly_mask": poly_mask_path,
             "product_mask": product_mask_path,

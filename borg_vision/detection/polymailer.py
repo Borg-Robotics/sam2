@@ -6,6 +6,8 @@ constants replaced by fields of a PolymailerConfig passed as the first argument.
 Generic, config-free helpers are reused from detection.package.
 """
 
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -393,6 +395,269 @@ def measure_edge_points(cfg, poly, dimensions, depth_roi, face_depth_mm, intrins
     }
 
 
+def _patch_plane(cfg, depth_roi, cx, cy, radius,
+                 min_valid_px=None, min_valid_frac=None, min_depth_levels=None):
+    """Fit a plane to the valid depth in a disc. Returns (rms_mm, tilt_deg, count).
+
+    Only RELATIVE depth inside the patch matters here, so absolute stereo range
+    error at working distance does not affect the result.
+
+    The three sparsity guards default to this module's poly_grasp_* settings but
+    can be passed explicitly, so a config without those fields (ObjectConfig, via
+    the object-mode grasp scorer) can share this helper rather than copy it.
+    """
+    if min_valid_px is None:
+        min_valid_px = cfg.poly_grasp_min_valid_px
+    if min_valid_frac is None:
+        min_valid_frac = cfg.poly_grasp_min_valid_frac
+    if min_depth_levels is None:
+        min_depth_levels = cfg.poly_grasp_min_depth_levels
+    h, w = depth_roi.shape[:2]
+    x1, x2 = max(cx - radius, 0), min(cx + radius + 1, w)
+    y1, y2 = max(cy - radius, 0), min(cy + radius + 1, h)
+    patch = depth_roi[y1:y2, x1:x2].astype(np.float32)
+
+    yy, xx = np.mgrid[y1:y2, x1:x2]
+    disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+    valid = (
+        disc
+        & (patch > cfg.min_valid_depth_mm)
+        & (patch < cfg.max_valid_depth_mm)
+    )
+    count = int(valid.sum())
+    if count < min_valid_px:
+        return None, None, count
+
+    # Reject patches the sensor barely resolved. Without these two guards a patch
+    # where stereo returned one constant value scores rms=0 -- a PERFECT flatness
+    # score for the region the camera understood least. Absence of measurement is
+    # not evidence of flatness.
+    if count < min_valid_frac * disc.sum():
+        return None, None, count
+    if np.unique(patch[valid]).size < min_depth_levels:
+        return None, None, count
+
+    px = xx[valid].astype(np.float32)
+    py = yy[valid].astype(np.float32)
+    pz = patch[valid]
+
+    A = np.column_stack([px - cx, py - cy, np.ones_like(px)])
+    coef, *_ = np.linalg.lstsq(A, pz, rcond=None)
+    rms = float(np.sqrt(np.mean((pz - A @ coef) ** 2)))
+    tilt = float(np.degrees(np.arctan(np.hypot(coef[0], coef[1]))))
+    return rms, tilt, count
+
+
+def score_grasp_candidates(
+    cfg,
+    poly,
+    product,
+    poly_center_full,
+    edges,
+    depth_roi,
+    face_depth_mm,
+    intrinsics,
+    side=None,
+):
+    """Rank suction-cup grasp points in one region of the polymailer.
+
+    `side` is "bottom" or "top" -- the END to grasp, chosen by the caller as the
+    opposite of the cut side so the cup never sits on the opening the product
+    slides out of. The search covers that half and centres on its geometric
+    release-grasp point.
+
+    The single release-grasp point is a fixed geometric midpoint, so when it lands
+    on a crease or the shoulder of the product bulge there is nothing to fall back
+    to. This scores a grid of nearby positions on surface quality and returns them
+    best-first, so a failed grasp can retry somewhere sensible.
+
+    Scored per candidate, over a disc the size of the real suction cup:
+      - plane-fit RMS residual  -> roughness (creases, bulge shoulder)
+      - plane tilt              -> how badly a straight-down cup would land askew
+      - distance from the bulge boundary -> the dome's edge is the worst case
+      - distance from the nominal pick   -> stay put unless the surface says move
+
+    Deliberately not scored: RGB texture. Print and labels are high-contrast but
+    perfectly good to grab; creases show in depth, printing does not.
+
+    Returns a list of dicts with camera-frame x/y/z in mm, plus the raw terms, so
+    the caller can see why something ranked where it did.
+    """
+    if side not in ("bottom", "top"):
+        return []
+
+    poly_mask = (poly["mask"] > 0).astype(np.uint8)
+    product_mask = product.get("mask")
+    if product_mask is None:
+        product_mask = np.zeros_like(poly_mask)
+    product_mask = (product_mask > 0).astype(np.uint8)
+
+    if poly_center_full is None:
+        return []
+
+    rows_all = np.nonzero(poly_mask)[0]
+    if rows_all.size == 0:
+        return []
+    row_min, row_max = int(rows_all.min()), int(rows_all.max())
+    centre_row = poly_center_full[1] - cfg.roi_y1
+
+    # Region gate + where the search is centred. "top"/"bottom" follow the
+    # library's image-row convention (bottom = larger rows), matching cut_side.
+    edge_full = edges.get(f"{side}_point_full")
+    if edge_full is None:
+        return []
+    if side == "bottom":
+        row_lo, row_hi = centre_row, float(row_max)
+    else:
+        row_lo, row_hi = float(row_min), centre_row
+    # Anchor is set after mm_per_px is known -- see below.
+    nx = ny = None
+
+    # Scale from the mailer's own measured span, so the cup size in mm converts to
+    # pixels without needing a separate calibration.
+    span_px = float(row_max - row_min)
+    span_mm = abs(edges.get("bottom_y_mm", 0.0) - edges.get("top_y_mm", 0.0))
+    if span_px <= 0 or span_mm <= 0:
+        return []
+    mm_per_px = span_mm / span_px
+
+    # Anchor the search near the mailer's outer end rather than at the geometric
+    # midpoint. Grabbing further out gives a longer clear slope for the product to
+    # slide down and keeps the cup well away from the bulge -- measurably better on
+    # hardware. The setback stops it hugging the edge, where the film goes floppy
+    # and the cup would half-overhang; w_edge and the hard margin back that up.
+    if nx is None:
+        edge_roi = (edge_full[0] - cfg.roi_x1, edge_full[1] - cfg.roi_y1)
+        centre_roi = (poly_center_full[0] - cfg.roi_x1, centre_row)
+        dx = centre_roi[0] - edge_roi[0]
+        dy = centre_roi[1] - edge_roi[1]
+        norm_d = math.hypot(dx, dy)
+        if norm_d < 1e-6:
+            nx, ny = edge_roi
+        else:
+            setback_px = cfg.poly_grasp_edge_setback_mm / mm_per_px
+            setback_px = min(setback_px, norm_d)   # never past the mailer centre
+            nx = int(round(edge_roi[0] + dx / norm_d * setback_px))
+            ny = int(round(edge_roi[1] + dy / norm_d * setback_px))
+    end_row = edge_roi[1]
+
+    radius_px = max(int(round((cfg.poly_grasp_cup_diameter_mm / 2.0) / mm_per_px)), 3)
+    margin_px = int(round(cfg.poly_grasp_edge_margin_mm / mm_per_px))
+    max_offset_px = cfg.poly_grasp_max_offset_mm / mm_per_px
+
+    # Distance along the mailer from the grasped end, as a BAND rather than a
+    # minimum. Too near the end and the film is floppy under the cup; too far in
+    # and the cup ends up over the product with a short slope for it to slide
+    # down. The isotropic d_edge gate below cannot express this -- it treats the
+    # side edges the same as the end -- so the two are enforced separately, which
+    # is also what lets the sides be more permissive than the end.
+    band_lo_px = cfg.poly_grasp_end_band_min_mm / mm_per_px
+    band_hi_px = cfg.poly_grasp_end_band_max_mm / mm_per_px
+
+    d_edge = cv2.distanceTransform(poly_mask, cv2.DIST_L2, 5)
+    # Distance FROM the bulge boundary, inside or out. Landing squarely on the
+    # product is fine -- it is the boundary itself, where the cup straddles the
+    # dome's shoulder and rocks, that scores badly. This is a soft term only: a
+    # hard "must clear the bulge" gate was tried and reverted, because it squeezed
+    # candidates onto the sloping back lip and left only one or two of them.
+    d_bulge = np.maximum(
+        cv2.distanceTransform(1 - product_mask, cv2.DIST_L2, 5),
+        cv2.distanceTransform(product_mask, cv2.DIST_L2, 5),
+    )
+
+    h, w = poly_mask.shape
+    step = max(cfg.poly_grasp_grid_step_px, 1)
+    cands = []
+    for y in range(radius_px, h - radius_px, step):
+        if y < row_lo or y > row_hi:
+            continue                          # outside the requested region
+        for x in range(radius_px, w - radius_px, step):
+            if d_edge[y, x] < radius_px + margin_px:
+                continue                      # cup fully on material
+            if not (band_lo_px <= abs(y - end_row) <= band_hi_px):
+                continue                      # outside the end-distance band
+            # Split the offset by axis. Rows run along the mailer's length (the
+            # axis bottom/top are defined on) and columns across its width, and
+            # the two want opposite things: stay centred across the width, where
+            # drifting sideways only moves the cup toward an edge for nothing,
+            # but reach freely along the length, where getting nearer the end
+            # buys a longer clear slope for the product and more distance from
+            # the bulge. So they are weighted separately rather than as one
+            # isotropic distance.
+            d_row = float(abs(y - ny))
+            d_col = float(abs(x - nx))
+            offset = float(np.hypot(d_col, d_row))
+            if offset > max_offset_px:
+                continue
+            rms, tilt, count = _patch_plane(cfg, depth_roi, x, y, radius_px)
+            if rms is None:
+                continue
+            cands.append({
+                "x_roi": x, "y_roi": y, "rms_mm": rms, "tilt_deg": tilt,
+                "valid_px": count, "offset_mm": offset * mm_per_px,
+                "off_col_mm": d_col * mm_per_px,
+                "off_row_mm": d_row * mm_per_px,
+                "bulge_dist_px": float(d_bulge[y, x]),
+                "edge_dist_px": float(d_edge[y, x]),
+            })
+
+    if not cands:
+        return []
+
+    def norm(key, invert):
+        v = np.array([c[key] for c in cands], dtype=np.float32)
+        lo, hi = v.min(), v.max()
+        if hi - lo < 1e-6:
+            return np.full_like(v, 0.5)
+        s = (v - lo) / (hi - lo)
+        return 1.0 - s if invert else s
+
+    s_rms = norm("rms_mm", True)
+    s_tilt = norm("tilt_deg", True)
+    s_bulge = norm("bulge_dist_px", False)
+    s_across = norm("off_col_mm", True)   # across the width -- stay centred
+    s_along = norm("off_row_mm", True)    # along the length -- weak, so it can
+                                          #   reach toward the end edge
+    s_edge = norm("edge_dist_px", False)
+
+    for i, c in enumerate(cands):
+        c["score"] = float(
+            cfg.poly_grasp_w_rough * s_rms[i]
+            + cfg.poly_grasp_w_tilt * s_tilt[i]
+            + cfg.poly_grasp_w_bulge * s_bulge[i]
+            + cfg.poly_grasp_w_across * s_across[i]
+            + cfg.poly_grasp_w_along * s_along[i]
+            + cfg.poly_grasp_w_edge * s_edge[i]
+        )
+
+    cands.sort(key=lambda c: -c["score"])
+
+    # Non-max suppression so the list is genuinely alternative spots, not a
+    # cluster of neighbouring pixels that would all fail the same way.
+    kept = []
+    min_sep = radius_px * 2
+    for c in cands:
+        if all((c["x_roi"] - k["x_roi"]) ** 2 + (c["y_roi"] - k["y_roi"]) ** 2
+               > min_sep * min_sep for k in kept):
+            kept.append(c)
+        if len(kept) >= cfg.poly_grasp_max_candidates:
+            break
+
+    for c in kept:
+        full = (c["x_roi"] + cfg.roi_x1, c["y_roi"] + cfg.roi_y1)
+        # Same depth sampling as every other measured point in this module, with
+        # the same face-depth fallback when the local patch is too sparse.
+        depth, _ = center_depth_mm(
+            cfg, depth_roi, poly["mask"], (c["x_roi"], c["y_roi"]))
+        if depth is None:
+            depth = face_depth_mm
+        x_mm, y_mm = pixel_to_camera_xy_mm(full, depth, intrinsics)
+        c["x_mm"], c["y_mm"], c["z_mm"] = x_mm, y_mm, depth
+        c["point_full"] = full
+
+    return kept
+
+
 def choose_polymailer_mask(cfg, masks, roi_rgb):
     h, w = roi_rgb.shape[:2]
     roi_area = h * w
@@ -566,6 +831,39 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
         intrinsics,
     )
 
+    # Grasp the END OPPOSITE the cut, so the cup is never sitting on the opening
+    # the product has to slide out of. The cut side is already chosen from the
+    # product's own clearance, so this needs no separate input -- and no caller
+    # can pick the two inconsistently.
+    #
+    # cut_side is None when no product bulge was found, in which case there is no
+    # basis for either choice and the grasp is left empty rather than guessed.
+    grasp_side = {"TOP": "bottom", "BOTTOM": "top"}.get(cut["cut_side"])
+
+    # Computed while the mailer is still closed: after cutting, the bulge mask is
+    # unreliable and these inputs are gone.
+    grasp_candidates = score_grasp_candidates(
+        cfg,
+        poly=poly,
+        product=product,
+        poly_center_full=poly_center_full,
+        edges=edges,
+        depth_roi=depth_roi,
+        face_depth_mm=polymailer_face_depth_mm,
+        intrinsics=intrinsics,
+        side=grasp_side,
+    )[:cfg.poly_grasp_max_candidates]
+
+    # The point to pick at, then two retries. When nothing could be scored -- no
+    # cut side to derive an end from, or depth too sparse to fit a plane -- fall
+    # back to the mailer's own centre, which is always measured. It is a worse
+    # pick than a scored one (it sits over the product bulge more often than not)
+    # but it is on the mailer and it is never missing.
+    best = grasp_candidates[0] if grasp_candidates else None
+    grasp_x_mm = best["x_mm"] if best else center_x_mm
+    grasp_y_mm = best["y_mm"] if best else center_y_mm
+    grasp_z_mm = best["z_mm"] if best else polymailer_face_depth_mm
+
     if product["center_roi"] is not None:
         product_center_full = (
             cfg.roi_x1 + product["center_roi"][0],
@@ -613,6 +911,11 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
         "product_inside_center_face_depth": product_inside_center_face_depth,
         "cut": cut,
         "edges": edges,
+        "grasp_candidates": grasp_candidates,
+        "grasp_x_mm": grasp_x_mm,
+        "grasp_y_mm": grasp_y_mm,
+        "grasp_z_mm": grasp_z_mm,
+        "grasp_side": grasp_side,
         "depth_heatmap": depth_heatmap,
         "final_output": {
             "polymailer_face_depth_mm": polymailer_face_depth_mm,
@@ -635,5 +938,10 @@ def run_sam2_polymailer(cfg, frame_bgr, depth_aligned, mask_generator, intrinsic
             "bottom_edge_x_mm": edges["bottom_x_mm"],
             "bottom_edge_y_mm": edges["bottom_y_mm"],
             "bottom_edge_z_mm": edges["bottom_z_mm"],
+            "grasp_x_mm": grasp_x_mm,
+            "grasp_y_mm": grasp_y_mm,
+            "grasp_z_mm": grasp_z_mm,
+            "grasp_side": grasp_side,
+            "grasp_candidates": grasp_candidates,
         },
     }

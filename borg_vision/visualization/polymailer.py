@@ -148,6 +148,30 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         cv2.circle(depth_vis, (ex, ey), 7, (0, 255, 128), -1)
         cv2.circle(depth_vis, (ex, ey), 14, (0, 255, 128), 2)
 
+    # The pick (rank 0, green) and its two retries (orange), so the debug image
+    # alone shows where the cup is going and what it would try next.
+    for rank, cand in enumerate(result.get("grasp_candidates") or []):
+        point = cand.get("point_full")
+
+        if point is None:
+            continue
+
+        cx_c, cy_c = point
+        colour = (0, 255, 0) if rank == 0 else (0, 200, 255)
+        cv2.circle(result_rgb, (cx_c, cy_c), 4, colour, -1)
+        cv2.circle(result_rgb, (cx_c, cy_c), 22, colour, 2)
+        cv2.putText(
+            result_rgb,
+            "PICK" if rank == 0 else str(rank),
+            (cx_c + 26, cy_c + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            colour,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.circle(depth_vis, (cx_c, cy_c), 22, colour, 2)
+
     cut = result["cut"]
 
     if cut["cut_side"] is not None:
@@ -189,6 +213,8 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         f"top_gap_mm={fmt3(cut['top_gap_mm'])}  bottom_gap_mm={fmt3(cut['bottom_gap_mm'])}",
         f"top_edge xyz=({fmt3(edges['top_x_mm'])}, {fmt3(edges['top_y_mm'])}, {fmt3(edges['top_z_mm'])})",
         f"bottom_edge xyz=({fmt3(edges['bottom_x_mm'])}, {fmt3(edges['bottom_y_mm'])}, {fmt3(edges['bottom_z_mm'])})",
+        f"grasp[{result.get('grasp_side') or '-'}] xyz=({fmt3(result.get('grasp_x_mm'))}, "
+        f"{fmt3(result.get('grasp_y_mm'))}, {fmt3(result.get('grasp_z_mm'))})",
     ]
 
     for i, line in enumerate(lines):
@@ -254,4 +280,21 @@ def make_json_result(cfg, result, timestamp):
         "bottom_edge_x_mm": json_number(edges["bottom_x_mm"]),
         "bottom_edge_y_mm": json_number(edges["bottom_y_mm"]),
         "bottom_edge_z_mm": json_number(edges["bottom_z_mm"]),
+        # THE point to grasp at, on the end opposite the cut.
+        "grasp_x_mm": json_number(result.get("grasp_x_mm")),
+        "grasp_y_mm": json_number(result.get("grasp_y_mm")),
+        "grasp_z_mm": json_number(result.get("grasp_z_mm")),
+        "grasp_side": result.get("grasp_side"),
+        # Ranked suction-cup fallbacks, best first. Camera frame, mm.
+        # The retries only. The scorer's list is the full ranking and its head IS
+        # grasp_point, so it is dropped: anything reading "the next candidate"
+        # must never be handed the point that just failed.
+        "grasp_candidates": [
+            {
+                "x_mm": json_number(c.get("x_mm")),
+                "y_mm": json_number(c.get("y_mm")),
+                "z_mm": json_number(c.get("z_mm")),
+            }
+            for c in (result.get("grasp_candidates") or [])[1:]
+        ],
     }
