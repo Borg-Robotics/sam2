@@ -188,15 +188,103 @@ class PackageConfig(BaseConfig):
     min_surface_depth_count: int = 30
 
     # ----- product-inside (polymailer) detection -----------------------
+    # The mailer drapes over the product, so depth shows a smooth DOME, not a
+    # slab with edges. Amplitude varies with mailer stock (a padded mailer
+    # spreads the same product into a ~5 mm dome where kraft gives ~10 mm), so
+    # every geometric knob below is RELATIVE -- a fraction of the dome's own
+    # height or of the package's own size -- and adapts per frame. The only
+    # absolute values left are the sanity rails at the bottom.
     product_inside_enable: bool = True
-    product_inside_edge_erode_px: int = 45
-    product_inside_min_closer_than_poly_mm: float = 8.0
-    product_inside_max_closer_than_poly_mm: float = 90.0
-    product_inside_close_kernel_px: int = 17
-    product_inside_dilate_px: int = 5
-    product_inside_min_area_ratio_of_package: float = 0.015
-    product_inside_max_area_ratio_of_package: float = 0.65
+
+    # Border band excluded from the search, as a fraction of the package span
+    # (sqrt of its area). Keeps the drooping mailer edge out of the plane fit.
+    #
+    # Kept small on purpose: at 0.12 this band was cutting into the product
+    # itself on 2 of 3 ground-truthed captures, clipping the footprint before
+    # the dome had finished falling off and dragging the reported centre away
+    # from the clipped side by 13-20 mm.
+    product_inside_edge_erode_frac: float = 0.05
+
+    # Low-pass applied to the elevation field, as a fraction of package span.
+    # Wrinkles are high-frequency, the product dome is not; this is what lets
+    # the threshold sit far below the wrinkle amplitude.
+    product_inside_smooth_frac: float = 0.035
+
+    # Reference surface: robust plane fit that iteratively trims the raised
+    # side, so the product cannot drag its own reference upward.
+    product_inside_plane_iterations: int = 5
+    product_inside_plane_trim_sigma: float = 1.5
+    product_inside_max_plane_points: int = 20000
+
+    # Dome peak is read at this percentile (not the max) so a few hot pixels
+    # cannot set the scale.
+    product_inside_peak_percentile: float = 99.5
+
+    # Baseline is read low rather than at the median: a product covering a big
+    # share of the mailer pulls the median up into its own dome, which shrinks
+    # the measured height and makes large products look like weak ones.
+    product_inside_baseline_percentile: float = 25.0
+
+    # Footprint = everything at least this fraction of the dome height. 0.5 is
+    # the half-maximum contour: scale-free, so it lands in the same relative
+    # place on a 5 mm padded dome and a 10 mm kraft dome.
+    product_inside_height_fraction: float = 0.5
+
+    # The measurement stereo drops out in streaks over low-texture kraft. A
+    # pixel with no reading of its own is still usable when enough of the
+    # smoothing kernel around it landed on valid depth; this is that minimum
+    # (as a fraction of the kernel). Raise it to trust interpolation less.
+    product_inside_min_blur_support: float = 0.25
+
+    # Closing kernel that rejoins a dome fragmented by those dropout streaks,
+    # as a fraction of the smoothing scale (so it too follows package size).
+    product_inside_close_frac: float = 1.0
+
+    # Trims thin tapering appendages off the footprint, as a fraction of the
+    # blob's own span. Where the mailer runs off the product it keeps sloping,
+    # and that ramp can hold above the half-max cut for a long way while staying
+    # narrow -- a spur that is drape, not product. Judged on width rather than
+    # height because the ramp reaches the same elevations the genuine far side
+    # of the dome does; only its cross-section gives it away. 0 disables.
+    product_inside_trim_frac: float = 0.18
+
+    # ----- product CORE (the reported centre) --------------------------
+    # The footprint above is the whole raised region, drape shoulders included;
+    # it is deliberately generous because a mailer's creases and slope make the
+    # true product outline unsegmentable. Its centroid is therefore pulled
+    # around by however the sheet happens to fall. The core is the crown of the
+    # dome -- the part most likely to be over the product itself -- and is what
+    # the reported centre and depth are taken from.
+    #
+    # The core keeps the part of the footprint that is NOT sloping. Where the
+    # mailer runs off the product it descends continuously, and that slope makes
+    # up most of the footprint's area -- so a centroid over the whole footprint,
+    # or over any contour of it, is really measuring the drape.
+    #
+    # Cut is relative to the slope found in this frame's own footprint (a
+    # fraction of its 90th-percentile gradient), so nothing here is a fixed
+    # millimetre or a fixed direction. Checked against three hand-outlined
+    # captures it roughly halved the centre error, 59 mm -> 28 mm.
+    product_inside_core_max_slope_frac: float = 0.25
+
+    # Opening applied to the core, as a fraction of its own span.
+    product_inside_core_open_frac: float = 0.10
+
+
+    # If the crown comes out smaller than this share of the footprint the dome
+    # has no usable top, and the centre falls back to the footprint.
+    product_inside_core_min_frac_of_blob: float = 0.02
+
+    # Detection gate, expressed in multiples of the frame's own measured depth
+    # noise rather than in mm.
+    product_inside_min_peak_noise_multiple: float = 3.0
+
+    # Sanity rails (absolute, deliberately wide -- these reject nonsense, they
+    # do not tune the estimate).
+    product_inside_min_area_ratio_of_package: float = 0.02
+    product_inside_max_area_ratio_of_package: float = 0.80
     product_inside_min_valid_pixels: int = 80
+    product_inside_max_peak_mm: float = 90.0
 
     heatmap_max_closer_than_base_mm: float = 180.0
 

@@ -2211,7 +2211,122 @@ def estimate_package_dimensions_mm(cfg, info, depth_mm, intrinsics):
     }
 
 
+def masked_gaussian_blur(values, mask, sigma_px, return_support=False):
+    """Gaussian blur that ignores invalid pixels instead of bleeding zeros in.
+
+    The returned support is the fraction of the kernel that landed on valid
+    pixels, so it doubles as a confidence map: a dropout smaller than the kernel
+    still gets a well-supported interpolated value, a large one does not.
+    """
+    weight = mask.astype(np.float32)
+    data = np.where(mask, values, 0.0).astype(np.float32)
+
+    kernel_px = int(sigma_px * 6.0) | 1
+
+    num = cv2.GaussianBlur(data, (kernel_px, kernel_px), sigma_px)
+    den = cv2.GaussianBlur(weight, (kernel_px, kernel_px), sigma_px)
+
+    blurred = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-3)
+
+    if return_support:
+        return blurred, den
+
+    return blurred
+
+
+def fill_mask_holes(mask):
+    """Fill every enclosed hole in a binary mask.
+
+    Flood-fills the background inward from a border of zeros; whatever the flood
+    never reaches is enclosed, and is added back to the mask.
+    """
+    mask = mask.astype(np.uint8)
+
+    # Pad so the flood always has a border to start from, even for a blob that
+    # touches the image edge.
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    flood = padded.copy()
+    cv2.floodFill(flood, np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8), (0, 0), 1)
+
+    enclosed = (flood == 0)[1:-1, 1:-1]
+
+    return (mask | enclosed).astype(np.uint8)
+
+
+def fit_reference_plane(
+    depth_roi,
+    mask,
+    max_points=20000,
+    iterations=5,
+    trim_sigma=1.5,
+):
+    """Robust plane through the mailer surface, trimming the raised side.
+
+    A plain least-squares fit is dragged toward the product it is meant to
+    measure against, which shrinks the very signal we want. Re-fitting while
+    discarding points that sit well above the current plane keeps the reference
+    on the flat mailer.
+
+    Takes explicit tuning arguments rather than a cfg so BOTH the package and
+    polymailer modes can share it -- their config classes name these fields
+    differently, and duplicating the fit is how the two modes drift apart.
+    """
+    yy, xx = np.where(mask)
+    zz = depth_roi[mask].astype(np.float64)
+
+    if zz.size > max_points:
+        rng = np.random.default_rng(12345)
+        idx = rng.choice(zz.size, size=max_points, replace=False)
+        xs, ys, zs = xx[idx], yy[idx], zz[idx]
+    else:
+        xs, ys, zs = xx, yy, zz
+
+    keep = np.ones(zs.shape, dtype=bool)
+    coeffs = None
+
+    for _ in range(max(1, iterations)):
+        if int(keep.sum()) < 32:
+            break
+
+        a = np.column_stack(
+            [
+                xs[keep].astype(np.float64),
+                ys[keep].astype(np.float64),
+                np.ones(int(keep.sum())),
+            ]
+        )
+
+        coeffs, _, _, _ = np.linalg.lstsq(a, zs[keep], rcond=None)
+
+        residual = zs - (coeffs[0] * xs + coeffs[1] * ys + coeffs[2])
+
+        # The product is CLOSER to the camera, i.e. a negative depth residual.
+        # Spread is measured on the lower (product-free) half so the product
+        # cannot inflate the very scale used to reject it.
+        low, high = np.percentile(residual, [2.0, 60.0])
+        sigma = (high - low) / 1.2 if high > low else 1.0
+
+        keep = residual > -trim_sigma * sigma
+
+    if coeffs is None:
+        return None
+
+    grid_y, grid_x = np.indices(depth_roi.shape)
+
+    return (coeffs[0] * grid_x + coeffs[1] * grid_y + coeffs[2]).astype(np.float32)
+
+
 def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_depth_mm, intrinsics):
+    """Locate the product inside a polymailer from its depth signature.
+
+    The mailer is not rigid: it drapes over whatever is inside, so depth shows a
+    smooth dome with sloped shoulders rather than an object with edges. There is
+    no true boundary to threshold, and the dome's height depends on the mailer
+    stock (padding spreads the same product into a lower, broader dome). So the
+    estimate is built entirely from ratios: the reference surface is fitted per
+    frame, the cut is a fraction of the dome's own height, and the detection
+    gate is a multiple of the frame's own depth noise.
+    """
     empty = {
         "found": False,
         "center_roi": None,
@@ -2222,7 +2337,14 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         "area_px": 0,
         "area_ratio_of_package": 0.0,
         "mask": np.zeros_like(package_mask, dtype=np.uint8),
+        "core_mask": np.zeros_like(package_mask, dtype=np.uint8),
+        "core_area_px": 0,
+        "core_found": False,
         "reason": "not_run",
+        "peak_mm": None,
+        "noise_mm": None,
+        "peak_noise_multiple": None,
+        "threshold_mm": None,
     }
 
     if not cfg.product_inside_enable:
@@ -2236,7 +2358,12 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         empty["reason"] = "empty_package_mask"
         return empty
 
-    inner_mask = erode_mask(package_mask, cfg.product_inside_edge_erode_px)
+    # Every pixel length below is derived from the package's own size, so the
+    # same settings hold for a small mailer and a large one.
+    package_span_px = float(np.sqrt(package_area))
+    erode_px = max(1, int(round(package_span_px * cfg.product_inside_edge_erode_frac)))
+
+    inner_mask = erode_mask(package_mask, erode_px)
 
     if int(inner_mask.sum()) < cfg.product_inside_min_valid_pixels:
         inner_mask = package_mask.copy()
@@ -2247,35 +2374,132 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         & (depth_roi < cfg.max_valid_depth_mm)
     )
 
-    values = depth_roi[valid_inner].astype(np.float32)
-
-    if values.size < cfg.product_inside_min_valid_pixels:
+    if int(valid_inner.sum()) < cfg.product_inside_min_valid_pixels:
         empty["reason"] = "not_enough_depth"
         return empty
 
-    poly_surface_depth = float(np.median(values))
-
-    closer_mm = np.zeros_like(depth_roi, dtype=np.float32)
-    closer_mm[valid_inner] = poly_surface_depth - depth_roi[valid_inner].astype(np.float32)
-
-    product_candidate = (
-        valid_inner
-        & (closer_mm >= cfg.product_inside_min_closer_than_poly_mm)
-        & (closer_mm <= cfg.product_inside_max_closer_than_poly_mm)
-    ).astype(np.uint8)
-
-    product_candidate = close_mask(
-        product_candidate,
-        cfg.product_inside_close_kernel_px,
-        iterations=1,
+    plane = fit_reference_plane(
+        depth_roi,
+        valid_inner,
+        max_points=cfg.product_inside_max_plane_points,
+        iterations=cfg.product_inside_plane_iterations,
+        trim_sigma=cfg.product_inside_plane_trim_sigma,
     )
 
-    product_candidate = dilate_mask(product_candidate, cfg.product_inside_dilate_px)
+    if plane is None:
+        empty["reason"] = "no_reference_plane"
+        return empty
+
+    # Positive = raised toward the camera relative to the fitted mailer surface.
+    raw_elevation = np.where(
+        valid_inner,
+        plane - depth_roi.astype(np.float32),
+        0.0,
+    ).astype(np.float32)
+
+    smooth_px = max(2.0, package_span_px * cfg.product_inside_smooth_frac)
+    elevation, support = masked_gaussian_blur(
+        raw_elevation,
+        valid_inner,
+        smooth_px,
+        return_support=True,
+    )
+
+    # What the blur removed is per-pixel sensor noise; its spread is this
+    # frame's own depth noise, which is what the detection gate is scaled to.
+    high_pass = (raw_elevation - elevation)[valid_inner]
+    noise_mm = float(1.4826 * np.median(np.abs(high_pass - np.median(high_pass))))
+    noise_mm = max(noise_mm, 1e-3)
+
+    inner_elevation = elevation[valid_inner]
+    baseline_mm = float(
+        np.percentile(inner_elevation, cfg.product_inside_baseline_percentile)
+    )
+    peak_mm = float(np.percentile(inner_elevation, cfg.product_inside_peak_percentile))
+    dome_mm = peak_mm - baseline_mm
+
+    empty["peak_mm"] = dome_mm
+    empty["noise_mm"] = noise_mm
+    empty["peak_noise_multiple"] = dome_mm / noise_mm
+
+    if dome_mm > cfg.product_inside_max_peak_mm:
+        empty["reason"] = "peak_out_of_range"
+        return empty
+
+    if dome_mm < cfg.product_inside_min_peak_noise_multiple * noise_mm:
+        empty["reason"] = "no_dome_above_noise"
+        return empty
+
+    # Half-maximum contour of the dome. Being a fraction of the dome's own
+    # height, it lands in the same relative place whatever the mailer stock.
+    threshold_mm = baseline_mm + cfg.product_inside_height_fraction * dome_mm
+    empty["threshold_mm"] = threshold_mm
+
+    # Candidacy is judged on the smoothed field over the whole inner region, not
+    # only where a pixel had its own depth reading. The measurement stereo drops
+    # out in streaks over low-texture kraft (~8% of the mailer on a typical
+    # capture), and requiring per-pixel validity let every one of those streaks
+    # punch a notch into the product. The blur already interpolates across a
+    # dropout smaller than its kernel; `support` is what says whether it could.
+    well_supported = support >= cfg.product_inside_min_blur_support
+    product_candidate = (
+        (elevation >= threshold_mm) & (inner_mask == 1) & well_supported
+    ).astype(np.uint8)
+
+    # Opening at a fraction of the smoothing scale drops speckle without the
+    # close+dilate that used to inflate a sparse scatter into a solid blob.
+    open_px = max(1, int(round(smooth_px * 0.5)))
+    product_candidate = cv2.morphologyEx(
+        product_candidate,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_px * 2 + 1, open_px * 2 + 1)),
+    )
+
+    # Close before picking the component, so a dome broken into fragments by a
+    # dropout streak is rejoined rather than having all but its biggest piece
+    # thrown away. Kernel is relative to the smoothing scale, so it stays tied
+    # to the package's own size.
+    close_px = max(1, int(round(smooth_px * cfg.product_inside_close_frac)))
+    product_candidate = cv2.morphologyEx(
+        product_candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)),
+    )
+
     product_candidate = largest_component(product_candidate)
 
     if product_candidate is None:
         empty["reason"] = "no_component"
         return empty
+
+    product_area = int(product_candidate.sum())
+
+    # Trim thin spurs. Where the mailer runs off the edge of the product it
+    # keeps sloping, and that ramp can stay above the half-max cut well past the
+    # product while remaining narrow. It cannot be told apart by height -- it
+    # reaches the same elevations the real far side of the dome does -- so it is
+    # cut on width instead. Opening by reconstruction is no use here: the spur
+    # tapers continuously into the body rather than joining it at a neck, so a
+    # reconstruction just re-grows it.
+    if cfg.product_inside_trim_frac > 0.0:
+        trim_px = max(1, int(round(np.sqrt(product_area) * cfg.product_inside_trim_frac)))
+        trimmed = cv2.morphologyEx(
+            product_candidate,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (trim_px * 2 + 1, trim_px * 2 + 1)),
+        )
+        trimmed = largest_component(trimmed)
+
+        # Only accept the trim if something survived it; a dome thinner than the
+        # kernel in every direction should be reported as it is, not deleted.
+        if trimmed is not None and int(trimmed.sum()) > 0:
+            product_candidate = trimmed
+
+    # Anything still enclosed is interior: fill it so the result is one solid
+    # region. Filled pixels carry no weight in the centroid below (their
+    # elevation is under the threshold), so this changes the reported footprint
+    # without moving the reported centre.
+    product_candidate = fill_mask_holes(product_candidate)
 
     product_area = int(product_candidate.sum())
     area_ratio = product_area / max(package_area, 1)
@@ -2294,20 +2518,77 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         empty["area_ratio_of_package"] = float(area_ratio)
         return empty
 
-    center_roi = get_mask_center(product_candidate)
+    selected = product_candidate == 1
 
-    if center_roi is None:
+    # The footprint is the whole raised region, drape shoulders and all, and the
+    # shoulders are most of its area -- so its centroid answers "where is the
+    # bulge", not "where is the product". The product is what the sheet is
+    # resting ON, which is the part that is not sloping; everywhere the mailer
+    # runs off the product it descends continuously.
+    #
+    # So the core is the footprint with the sloping part removed. The cut is a
+    # fraction of the slope present in this frame's own footprint, which keeps
+    # it free of both fixed millimetres and any assumed direction.
+    grad_x = cv2.Sobel(elevation, cv2.CV_32F, 1, 0, ksize=5) / 8.0
+    grad_y = cv2.Sobel(elevation, cv2.CV_32F, 0, 1, ksize=5) / 8.0
+    slope = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+
+    slope_reference = float(np.percentile(slope[selected], 90.0))
+    max_slope = cfg.product_inside_core_max_slope_frac * slope_reference
+
+    core = (selected & (slope <= max_slope)).astype(np.uint8)
+
+    core_open_px = max(1, int(round(np.sqrt(max(int(core.sum()), 1))
+                                    * cfg.product_inside_core_open_frac)))
+    core = cv2.morphologyEx(
+        core,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_open_px * 2 + 1, core_open_px * 2 + 1)),
+    )
+
+    core = largest_component(core)
+
+    if core is not None:
+        core = fill_mask_holes(core)
+
+    core_ok = (
+        core is not None
+        and int(core.sum()) >= cfg.product_inside_core_min_frac_of_blob * product_area
+    )
+
+    if core_ok:
+        centre_source = core == 1
+        core_area = int(core.sum())
+    else:
+        # Nothing in the footprint was flat enough to read as supported: the
+        # whole bulge is slope. Fall back to the footprint rather than report
+        # nothing, and say so via core_found.
+        core = np.zeros_like(product_candidate)
+        centre_source = selected
+        core_area = 0
+
+    yy, xx = np.where(centre_source)
+
+    if yy.size == 0:
         empty["reason"] = "no_center"
         empty["mask"] = product_candidate
         empty["area_px"] = product_area
         empty["area_ratio_of_package"] = float(area_ratio)
         return empty
 
-    cx_roi, cy_roi = center_roi
-    center_full = (int(cfg.roi_x1 + cx_roi), int(cfg.roi_y1 + cy_roi))
+    cx_roi = float(xx.mean())
+    cy_roi = float(yy.mean())
+    center_full = (int(round(cfg.roi_x1 + cx_roi)), int(round(cfg.roi_y1 + cy_roi)))
+
+    # Depth comes from the same core. Averaging over the whole footprint would
+    # run down the dome's shoulders and report the product as deeper than it is.
+    supported = centre_source
+
+    if int(supported.sum()) < cfg.min_surface_depth_count:
+        supported = selected
 
     product_values = depth_roi[
-        (product_candidate == 1)
+        supported
         & (depth_roi > cfg.min_valid_depth_mm)
         & (depth_roi < cfg.max_valid_depth_mm)
     ].astype(np.float32)
@@ -2326,14 +2607,21 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
 
     return {
         "found": True,
-        "center_roi": (int(cx_roi), int(cy_roi)),
+        "center_roi": (int(round(cx_roi)), int(round(cy_roi))),
         "center_full": center_full,
         "center_x_mm": center_x_mm,
         "center_y_mm": center_y_mm,
         "depth_mm": product_depth_mm,
         "area_px": product_area,
+        "peak_mm": dome_mm,
+        "noise_mm": noise_mm,
+        "peak_noise_multiple": dome_mm / noise_mm,
+        "threshold_mm": threshold_mm,
         "area_ratio_of_package": float(area_ratio),
         "mask": product_candidate,
+        "core_mask": core,
+        "core_area_px": core_area,
+        "core_found": bool(core_ok),
         "reason": "ok",
     }
 
@@ -2448,9 +2736,17 @@ def run_sam_package_depth_type(
     )
 
     if classification["package_type"] == "polymailer":
+        # Classification depth, not measurement depth. The measurement stream is
+        # the right one for DIMENSIONS -- sparse but accurate in absolute depth.
+        # Product-inside needs the opposite: it reads a few-mm RELATIVE bulge, so
+        # density and resolution matter more than absolute accuracy. The
+        # classification stream runs at full rgb_size against the measurement
+        # stream's 640x400, which halves depth quantisation, and it carries
+        # 97-98% valid pixels on the mailer against 91-94% -- the dropouts being
+        # what tore holes in the footprint in the first place.
         product_inside = detect_product_inside_polymailer(
             cfg,
-            depth_roi=depth_measure_roi,
+            depth_roi=depth_class_roi,
             package_mask=best["mask"],
             center_full_depth_mm=top_face_depth_mm,
             intrinsics=intrinsics,
@@ -2466,7 +2762,14 @@ def run_sam_package_depth_type(
             "area_px": 0,
             "area_ratio_of_package": 0.0,
             "mask": np.zeros_like(best["mask"], dtype=np.uint8),
+            "core_mask": np.zeros_like(best["mask"], dtype=np.uint8),
+            "core_area_px": 0,
+            "core_found": False,
             "reason": "not_polymailer",
+            "peak_mm": None,
+            "noise_mm": None,
+            "peak_noise_multiple": None,
+            "threshold_mm": None,
         }
 
     heatmap = make_package_depth_heatmap(

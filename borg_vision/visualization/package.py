@@ -63,6 +63,25 @@ def make_package_depth_heatmap(cfg, depth_roi, package_mask, center_roi, product
             + 0.65 * yellow[product_mask == 1]
         ).astype(np.uint8)
 
+        # Second layer: the crown of the dome, i.e. the part of that footprint
+        # most likely lying on the product itself rather than on the mailer
+        # sloping off it. This is where the reported centre comes from.
+        core_mask = product_inside.get("core_mask")
+
+        if core_mask is not None and int(core_mask.sum()) > 0:
+            core_mask = core_mask.astype(np.uint8)
+
+            magenta = np.zeros_like(heatmap)
+            magenta[:, :] = (255, 0, 255)
+
+            heatmap[core_mask == 1] = (
+                0.45 * heatmap[core_mask == 1]
+                + 0.55 * magenta[core_mask == 1]
+            ).astype(np.uint8)
+
+            contours, _ = cv2.findContours(core_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(heatmap, contours, -1, (255, 255, 255), 2)
+
         pcx, pcy = product_inside["center_roi"]
         cv2.circle(heatmap, (pcx, pcy), 8, (0, 255, 255), -1)
         cv2.circle(heatmap, (pcx, pcy), 16, (0, 255, 255), 2)
@@ -297,6 +316,18 @@ def make_json_result(cfg, result, timestamp):
             "reason": product_inside["reason"],
             "area_px": int(product_inside["area_px"]),
             "area_ratio_of_package": json_number(product_inside["area_ratio_of_package"]),
+            # Dome height above the fitted mailer surface, this frame's depth
+            # noise, and their ratio -- the ratio is what the gate tests, so it
+            # is the number to look at when a product is missed or invented.
+            "dome_mm": json_number(product_inside.get("peak_mm")),
+            "noise_mm": json_number(product_inside.get("noise_mm")),
+            "dome_noise_multiple": json_number(product_inside.get("peak_noise_multiple")),
+            "threshold_mm": json_number(product_inside.get("threshold_mm")),
+            # The crown the reported centre is taken from. core_found False
+            # means the dome had no usable top and the centre fell back to the
+            # whole footprint.
+            "core_found": bool(product_inside.get("core_found", False)),
+            "core_area_px": int(product_inside.get("core_area_px", 0)),
         },
         "size_scale": json_number(cfg.package_size_scale),
         "base_depth_mm": json_number(cfg.base_depth_mm),

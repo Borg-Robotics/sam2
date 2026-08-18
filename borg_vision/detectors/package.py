@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from ..config import PackageConfig
 from ..detection import run_sam_package_depth_type
@@ -68,9 +69,10 @@ class PackageDetector(BaseDetector):
         return make_json_result(self.cfg, result.raw, timestamp)
 
     def save_debug(self, result, out_dir=None, timestamp=None):
-        """Save the same artifact set, with the same filenames, as the original
-        script (keys: dir, raw_rgb, result, mask, product_mask, heatmap, json,
-        result_bgr)."""
+        """Save the original script's artifact set (keys: dir, raw_rgb, result,
+        mask, product_mask, heatmap, json, result_bgr) plus the two raw depth
+        arrays (depth_measure_aligned, depth_class_aligned) needed to retune
+        product-inside detection offline."""
         cfg = self.cfg
 
         if timestamp is None:
@@ -86,14 +88,31 @@ class PackageDetector(BaseDetector):
         result_path = save_dir / artifact_name("package_final", "png", timestamp, organized)
         mask_path = save_dir / artifact_name("package_mask", "png", timestamp, organized)
         product_mask_path = save_dir / artifact_name("product_inside_mask", "png", timestamp, organized)
+        product_core_path = save_dir / artifact_name("product_core_mask", "png", timestamp, organized)
         heatmap_path = save_dir / artifact_name("package_depth_heatmap", "png", timestamp, organized)
         json_path = save_dir / artifact_name("package_final", "json", timestamp, organized)
+
+        # Both depth streams, unquantised. The heatmap is a JET-colourmapped,
+        # min-max-normalised, alpha-blended view, so it cannot be used to
+        # re-derive millimetres -- retuning product-inside detection offline
+        # needs the actual arrays. Measurement depth is what the product-inside
+        # estimate runs on; classification depth is the higher-resolution
+        # stream, kept so the two can be compared on the same capture.
+        depth_measure_path = save_dir / artifact_name(
+            "depth_measure_aligned", "npy", timestamp, organized
+        )
+        depth_class_path = save_dir / artifact_name(
+            "depth_class_aligned", "npy", timestamp, organized
+        )
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
         cv2.imwrite(str(result_path), result_bgr)
         save_binary_mask(mask_path, result.raw["mask"])
         save_binary_mask(product_mask_path, result.raw["product_inside"]["mask"])
+        save_binary_mask(product_core_path, result.raw["product_inside"]["core_mask"])
         cv2.imwrite(str(heatmap_path), result.raw["depth_heatmap"])
+        np.save(str(depth_measure_path), result.frames.depth_measure_aligned)
+        np.save(str(depth_class_path), result.frames.depth_class_aligned)
 
         if cfg.debug_save_all_accepted_masks:
             save_accepted_masks(save_dir, timestamp, result.raw, organized)
@@ -107,7 +126,10 @@ class PackageDetector(BaseDetector):
             "result": result_path,
             "mask": mask_path,
             "product_mask": product_mask_path,
+            "product_core_mask": product_core_path,
             "heatmap": heatmap_path,
+            "depth_measure_aligned": depth_measure_path,
+            "depth_class_aligned": depth_class_path,
             "json": json_path,
             "result_bgr": result_bgr,
         }
