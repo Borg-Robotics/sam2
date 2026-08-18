@@ -17,9 +17,11 @@ from .package import (
     close_mask,
     dilate_mask,
     erode_mask,
+    fit_reference_plane,
     get_mask_center,
     get_rotated_box_from_mask,
     largest_component,
+    masked_gaussian_blur,
     pixel_to_camera_xy_mm,
 )
 
@@ -216,17 +218,112 @@ def estimate_product_inside_polymailer(cfg, depth_roi, poly_mask, poly_center_ro
             "center_roi": None,
         }
 
-    surface_depth_mm = float(np.percentile(inside_values, cfg.poly_surface_depth_percentile))
+    # --- Reference surface: a fitted PLANE, not a global percentile ---------
+    # The percentile this replaces assumes the mailer lies flat and level. It
+    # does not -- it tilts and sags -- so a single depth value lands mid-slope,
+    # and the raised half of a bare mailer then clears any bulge threshold on
+    # its own. Fitting the surface per frame removes the mailer's own tilt
+    # before anything is measured against it.
+    #
+    # The fit is trimmed rather than plain least-squares, which would be dragged
+    # toward the product it is supposed to measure against and shrink the very
+    # signal wanted. Ported from package mode 2026-08-18, where it fixed an empty
+    # mailer reporting as a ~22% product.
+    plane = fit_reference_plane(
+        depth_roi,
+        valid_inside,
+        max_points=cfg.poly_product_max_plane_points,
+        iterations=cfg.poly_product_plane_iterations,
+        trim_sigma=cfg.poly_product_plane_trim_sigma,
+    )
 
+    if plane is None:
+        return {
+            "found": False,
+            "reason": "no_reference_plane",
+            "mask": np.zeros_like(poly_mask, dtype=np.uint8),
+            "surface_depth_mm": None,
+            "product_depth_mm": None,
+            "bulge_height_mm": None,
+            "area_ratio_of_poly": 0.0,
+            "bbox": None,
+            "center_roi": None,
+        }
+
+    surface_depth_mm = float(np.median(plane[valid_inside]))
+
+    # Positive = raised toward the camera relative to the fitted surface.
+    raw_elevation = np.where(
+        valid_inside, plane - depth_roi.astype(np.float32), 0.0
+    ).astype(np.float32)
+
+    # Pixel scales derived from the mailer's own size, so one setting covers a
+    # small mailer and a large one.
+    poly_span_px = float(np.sqrt(max(int(poly_mask.sum()), 1)))
+    smooth_px = max(2.0, poly_span_px * cfg.poly_product_smooth_frac)
+
+    elevation, support = masked_gaussian_blur(
+        raw_elevation, valid_inside, smooth_px, return_support=True
+    )
+
+    # What the blur removed is this frame's own sensor noise; the detection gate
+    # is scaled to it rather than to a fixed millimetre value, so the same
+    # setting holds as depth quality varies.
+    high_pass = (raw_elevation - elevation)[valid_inside]
+    noise_mm = float(1.4826 * np.median(np.abs(high_pass - np.median(high_pass))))
+    noise_mm = max(noise_mm, 1e-3)
+
+    inner_elevation = elevation[valid_inside]
+    baseline_mm = float(
+        np.percentile(inner_elevation, cfg.poly_product_baseline_percentile)
+    )
+    peak_mm = float(np.percentile(inner_elevation, cfg.poly_product_peak_percentile))
+    dome_mm = peak_mm - baseline_mm
+
+    if dome_mm < cfg.poly_product_min_peak_noise_multiple * noise_mm:
+        return {
+            "found": False,
+            "reason": "no_dome_above_noise",
+            "mask": np.zeros_like(poly_mask, dtype=np.uint8),
+            "surface_depth_mm": surface_depth_mm,
+            "product_depth_mm": None,
+            "bulge_height_mm": float(dome_mm),
+            "area_ratio_of_poly": 0.0,
+            "bbox": None,
+            "center_roi": None,
+        }
+
+    # Half-maximum contour of the dome. Being a fraction of the dome's OWN
+    # height, it lands in the same relative place whatever the mailer stock --
+    # padding spreads the same product into a lower, broader dome, which a fixed
+    # poly_bulge_min_mm could not follow.
+    threshold_mm = baseline_mm + cfg.poly_product_height_fraction * dome_mm
+
+    # Judge on the smoothed field wherever the blur had support, not only where
+    # a pixel had its own reading: the measurement stereo drops out in streaks
+    # over low-texture kraft, and requiring per-pixel validity lets every streak
+    # punch a notch into the product.
+    well_supported = support >= cfg.poly_product_min_blur_support
     product_candidate = (
-        valid_inside
-        & (depth_roi <= surface_depth_mm - cfg.poly_bulge_min_mm)
-        & (depth_roi >= surface_depth_mm - cfg.poly_bulge_max_mm)
+        (elevation >= threshold_mm) & (inner_mask == 1) & well_supported
     ).astype(np.uint8)
 
-    product_candidate = open_mask(product_candidate, cfg.poly_bulge_open_kernel_px, iterations=1)
-    product_candidate = close_mask(product_candidate, cfg.poly_bulge_close_kernel_px, iterations=2)
-    product_candidate = dilate_mask(product_candidate, cfg.poly_bulge_dilate_px)
+    # Open then close, at fractions of the smoothing scale. The old
+    # open+close+DILATE inflated a sparse scatter into a solid blob; closing
+    # after the open rejoins a dome split by a dropout streak without adding
+    # area that was never measured.
+    open_px = max(1, int(round(smooth_px * 0.5)))
+    product_candidate = cv2.morphologyEx(
+        product_candidate,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_px * 2 + 1, open_px * 2 + 1)),
+    )
+    close_px = max(1, int(round(smooth_px * cfg.poly_product_close_frac)))
+    product_candidate = cv2.morphologyEx(
+        product_candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)),
+    )
 
     product_candidate[poly_mask == 0] = 0
 

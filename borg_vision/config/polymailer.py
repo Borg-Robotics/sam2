@@ -157,7 +157,43 @@ class PolymailerConfig(BaseConfig):
 
     # Product bulge detection inside the polymailer.
     poly_inner_erode_px: int = 22
-    poly_surface_depth_percentile: int = 75
+
+    # ---- product-inside reference surface (ported from package mode) ------
+    # A robust PLANE fitted per frame, replacing poly_surface_depth_percentile.
+    # That percentile assumed the mailer lies flat and level; it tilts and sags,
+    # so one depth value lands mid-slope and the raised half of a BARE mailer
+    # clears any bulge threshold by itself. In package mode this was what made an
+    # empty mailer report as a ~22% product.
+    #
+    # The fit is trimmed, not plain least-squares -- an untrimmed fit is dragged
+    # toward the product it is measuring against and shrinks the signal.
+    poly_product_plane_iterations: int = 5
+    poly_product_plane_trim_sigma: float = 1.5
+    poly_product_max_plane_points: int = 20000
+
+    # ---- dome model ------------------------------------------------------
+    # The mailer drapes over the contents, so depth shows a smooth dome with
+    # sloped shoulders, not an object with edges. Every constant below is a
+    # RATIO for that reason: the dome's height depends on the mailer stock
+    # (padding spreads the same product into a lower, broader dome), so absolute
+    # millimetres cannot transfer between stocks. This is what
+    # poly_bulge_min_mm / poly_bulge_max_mm could not do.
+    #
+    # Smoothing and morphology scale with the mailer's own size (sqrt of its
+    # area), so one setting covers a small mailer and a large one.
+    poly_product_smooth_frac: float = 0.035
+    poly_product_close_frac: float = 1.0
+    # Cut at half the dome's own height -- the same relative place on any stock.
+    poly_product_height_fraction: float = 0.5
+    poly_product_baseline_percentile: float = 25.0
+    poly_product_peak_percentile: float = 99.5
+    # Detection gate as a multiple of THIS frame's measured depth noise, so it
+    # holds as depth quality varies rather than needing a fixed mm threshold.
+    poly_product_min_peak_noise_multiple: float = 3.0
+    # Minimum blur support for a pixel to be judged. The measurement stereo drops
+    # out in streaks over low-texture kraft; requiring per-pixel validity let
+    # every streak punch a notch into the product.
+    poly_product_min_blur_support: float = 0.25
 
     poly_bulge_min_mm: float = 7
     poly_bulge_max_mm: float = 140
