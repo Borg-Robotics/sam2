@@ -24,6 +24,14 @@ class BoxConfig(BaseConfig):
 
     base_depth_mm: float = 705.0
 
+    # Multiplier on the measured box WIDTH and LENGTH (not height -- that comes
+    # from depth, not from the mask). The raw pinhole result reads ~3% small:
+    # a 203 x 210 mm box reported 197.2 x 203.3.
+    #
+    # Box-only, deliberately separate from the package/polymailer *_size_scale
+    # (1.04) so tuning one cannot move the others.
+    box_size_scale: float = 1.03
+
     # Locked ROI.
     roi_x1: int = 330
     roi_y1: int = 30

@@ -254,7 +254,7 @@ image, a JSON of the measurements, and the mode's mask(s)/heatmap:
 
 | Mode | files (besides `raw_rgb_*.jpg`) |
 |---|---|
-| `package` | `package_final_*.png`, `package_mask_*.png`, `product_inside_mask_*.png`, `package_depth_heatmap_*.png`, `package_final_*.json` |
+| `package` | `package_final_*.png`, `package_mask_*.png`, `product_inside_mask_*.png`, `product_core_mask_*.png`, `package_depth_heatmap_*.png`, `depth_measure_aligned_*.npy`, `depth_class_aligned_*.npy`, `package_final_*.json` |
 | `box` | `cardboard_box_measurements_*.png`, `cardboard_box_mask_*.png`, `cardboard_box_measurements_*.json` |
 | `object` | `object_segment_depth_*.png`, `object_mask_*.png`, `depth_aligned_*.npy`, `object_segment_depth_*.json` |
 | `polymailer` | `polymailer_output_*.png`, `polymailer_mask_*.png`, `product_bulge_mask_*.png`, `polymailer_output_*.json` |
@@ -263,6 +263,159 @@ image, a JSON of the measurements, and the mode's mask(s)/heatmap:
 The annotated `*.png` is a side-by-side of RGB + depth (+ heatmap for modes
 that produce one). `draw_result(result)` returns the same image in memory
 without writing to disk.
+
+### Product-inside detection (polymailers)
+
+A mailer is not rigid. It drapes over whatever is inside, so depth shows a
+smooth **dome with sloped shoulders**, never an object with edges — there is no
+true boundary to threshold, and the same product produces a different dome
+depending on the stock. Padding spreads it into a low broad mound (~6 mm on the
+captures measured so far) where kraft gives a taller narrower one (~10 mm). A
+fixed millimetre threshold cannot straddle that: 8 mm found the kraft mailer and
+missed the padded one entirely.
+
+So nothing in the estimate is a fixed depth. Per frame:
+
+1. A robust plane is fitted to the mailer, **re-fitting while discarding the
+   raised side** so the product cannot drag up the surface it is measured
+   against. This is what removes mailer tilt, which on its own was comparable
+   to the whole signal.
+2. The elevation field is low-passed at a fraction of the package's own size.
+   Kraft wrinkles are high-frequency and the dome is not, which is what lets the
+   cut sit well below the wrinkle amplitude.
+3. Dome height is read as `p99.5 − p25` of that field. The low baseline matters:
+   against the median, a product covering much of the mailer pulls the baseline
+   up into its own dome and looks weak.
+4. The footprint is the **half-maximum contour** — a fraction of the dome's own
+   height, so it lands in the same relative place on any stock — and the centre
+   is the elevation-weighted centroid, which leans on the peak rather than on
+   wherever the contour happened to cut.
+5. Thin spurs are trimmed off (`product_inside_trim_frac`), and the result is
+   closed and hole-filled into one solid region.
+
+Step 5's trim exists because where the mailer runs off the edge of the product
+it keeps sloping, and that ramp can hold above the half-max cut well past the
+product while staying narrow. It cannot be rejected on height — it reaches the
+same elevations the genuine far side of the dome does — so it is cut on width
+instead, with a kernel scaled to the blob's own span. Opening *by
+reconstruction* does not work here: the spur tapers continuously into the body
+rather than joining it at a neck, so the reconstruction just re-grows it.
+
+Step 5 is mostly not what makes it solid. The measurement stereo **drops out in
+horizontal streaks over low-texture kraft** — around 8% of the mailer on a
+typical capture, against ~3% for the classification stream — and requiring each
+pixel to have its own depth reading let every streak carve a notch into the
+product. So candidacy is judged on the smoothed field wherever the blur had
+enough valid support around it (`product_inside_min_blur_support`), which
+bridges a dropout narrower than the kernel. On the 11-06-08 capture that lifts
+solidity from 0.86 to 0.97 and removes a truncation that had been pulling the
+reported centre ~6 mm off. `product_inside_close_frac` is the backstop for a
+dropout too wide to bridge: inert on good captures, but it is what keeps a dome
+split by a ~60 px band from collapsing onto one half.
+
+**Footprint vs core.** Those steps produce the *footprint* — the whole raised
+region, drape shoulders included. It is deliberately generous, because a
+mailer's creases and slope make the true product outline unsegmentable, and it
+is a good measure of extent. But its centroid answers "where is the bulge", not
+"where is the product": how far the sheet slopes off each side has nothing to do
+with the product, and the two centres differ by **8-11 mm** on the captures
+measured.
+
+So the reported centre and depth come from the **core**: the footprint with the
+*sloping* part removed. The product is what the sheet is resting on, and
+everywhere the mailer runs off the product it descends continuously — so the
+core keeps only what is flat enough to read as supported, cut at
+`product_inside_core_max_slope_frac` of the slope present in that frame's own
+footprint. It is saved as `product_core_mask_*.png` and drawn as a second
+magenta layer inside the yellow footprint.
+
+Measured against three hand-outlined captures (products of 140x90, 120x120 and
+90x90 mm, in different positions), this roughly halved the centre error:
+
+| estimator | mean error vs outline |
+|---|---|
+| footprint centroid | 52 mm |
+| dome peak | 65 mm |
+| height-contour core (previous) | 59 mm |
+| **slope-removal core + smaller erode band** | **26 mm** |
+
+Two things drove that. The slope removal is the larger part. The other is
+`product_inside_edge_erode_frac`, cut from 0.12 to 0.05: at 0.12 the border band
+was reaching into the product itself on 2 of the 3 captures, clipping the
+footprint before the dome had finished falling and pulling the centre 13-20 mm
+away from the clipped side.
+
+**~26 mm looks like the floor for a depth-only method, and the search for
+better has been done.** Everything below was measured against the same three
+outlines; nothing shape-based separates from the rest:
+
+| approach | mean | worst |
+|---|---|---|
+| footprint centroid | 47 mm | 63 mm |
+| height contour (best of 0.55-0.85) | 41 mm | 57 mm |
+| **slope-removal core (shipped)** | **26 mm** | 34 mm |
+| height + slope combined | 33 mm | — |
+| bias toward the measured steep edge | 25 mm | 30 mm |
+| Hessian blob-vs-ridge | 97 mm | 164 mm |
+| fusing both depth streams | 34 mm | 42 mm |
+| known product size, anchored at its edge | 20 mm | 28 mm |
+
+The strongest evidence that this is a floor rather than a tuning failure: the
+**same algorithm on the two depth streams of the same scene disagrees by up to
+26 mm** (11-51-07: 36 mm on measurement, 10 mm on classification, and the
+ranking flips on the next capture). The differences between the top methods are
+smaller than that, so choosing between them on these numbers would be fitting
+noise. The ground truth itself is hand-drawn and mapped from screenshots, with
+a demonstrated 12-54% size error, so its own uncertainty is comparable.
+
+Only supplying the product's true size broke out of the pack, and it needs
+information the station does not have at runtime.
+
+Product-inside therefore reads the **classification** depth, not the
+measurement depth the rest of package mode measures from. That is on principle
+rather than on the table above: it needs a few-mm *relative* bulge, so
+resolution and density beat absolute accuracy — full `rgb_size` against
+640x400 halves depth quantisation, and 97-98% valid pixels against 91-94% is
+what stops dropouts tearing the footprint.
+
+Treat the point as an estimate, not a measurement. The product side *is*
+measurable, incidentally — the footprint end that falls off more steeply was
+the product's end on all three captures — but converting that into a position
+still needs an extent the depth cannot supply.
+
+Two approaches that look obvious and do NOT work, so they don't get retried:
+
+- **A height contour** ("find the flat top"). The drape rounds every edge, so
+  even lightly smoothed the surface is a dome (0.49 → 1.01 → 0.60 across a
+  product), never a plateau with a step. Worse, the dome is asymmetric: a
+  product spans elevations 0.77 → 1.01 → 0.60, which no symmetric contour can
+  sit on correctly.
+- **RGB crease texture.** The sheet is taut over the product and slack around
+  it, and that is real at the footprint level (2.4-2.7x more crease energy
+  outside the footprint than on it, which independently corroborates the
+  footprint). Inside the footprint it is almost uniform, so it cannot localise
+  the product.
+
+If nothing in the footprint is flat enough, `core_found` is false and the centre
+falls back to the footprint.
+
+The one gate that is not self-scaling by construction is detection itself:
+`product_inside_min_peak_noise_multiple` asks how many multiples of *this
+frame's own measured depth noise* the dome must clear. The saved JSON reports
+`dome_mm`, `noise_mm` and `dome_noise_multiple` — that ratio is the number to
+read when a product is missed or invented.
+
+**This gate wants calibrating against empty mailers**, which is the one case no
+capture covers yet. An empty mailer's `dome_noise_multiple` is the
+false-positive floor; the setting belongs between it and what a loaded mailer of
+the same stock reports. Replay saved captures with:
+
+```bash
+python -m borg_vision.cli.tune_product_inside <capture_dir> [...] --sweep
+```
+
+which re-runs the detector over a capture's `.npy` depth dumps with no camera or
+SAM2, and reports centre stability across the relative knobs.
 
 ### Diagnostics deliberately NOT in the JSON
 

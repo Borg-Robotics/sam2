@@ -68,6 +68,23 @@ def estimate_box_dimensions_mm(cfg, box, depth_mm, intrinsics):
     width_mm = (w_px * depth_mm) / fx
     height_mm = (h_px * depth_mm) / fy
 
+    # Box-only size correction. The raw pinhole result reads small: measured on a
+    # 203 x 210 mm box it reported 197.2 x 203.3, needing 1.029 and 1.033.
+    #
+    # Applied to WIDTH and LENGTH only -- height comes from the depth difference,
+    # not from the mask, so it is not affected by this error.
+    #
+    # The other modes carry their own *_size_scale (1.04); this is the box's, and
+    # deliberately separate so tuning one cannot move the others.
+    #
+    # Worth knowing which shape of error this is, because it decides whether the
+    # constant transfers: a SCALE fits if the needed correction grows with box
+    # size, an OFFSET fits if it stays ~6 mm regardless. One box cannot tell them
+    # apart -- both fit these numbers. Measure a box of a noticeably different
+    # size before relying on this for anything but the box being cut today.
+    width_mm *= cfg.box_size_scale
+    height_mm *= cfg.box_size_scale
+
     length_mm = max(width_mm, height_mm)
     short_side_mm = min(width_mm, height_mm)
 
