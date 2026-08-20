@@ -46,6 +46,47 @@ class BoxConfig(BaseConfig):
 
     min_surface_depth_count: int = 30
 
+    # Minimum height a mask must stand above the base plane to be accepted as a
+    # box, i.e. base_depth_mm - box_face_depth_mm >= this. Rejects masks lying ON
+    # the table: the box grasp mechanism's tray scores as a large flat rectangle
+    # and wins whenever the box's own colour evidence weakens (a slight rotation
+    # under the clamp shadows part of the top face and dulls it). Two captures on
+    # 2026-08-20 (11-34-20 and 14-43-29) both reported the tray at a face depth
+    # of 706-707 mm against this 705 mm base -- at or BELOW the table -- as
+    # 389 x 309 and 389 x 232 mm boxes with success: true.
+    #
+    # Depth is the right gate because it is exactly what rotation does NOT
+    # degrade: in both failing frames the box remained a clean, well-separated
+    # depth plateau while its RGB score collapsed.
+    #
+    # This makes a bad detection FAIL rather than measure the wrong object; it
+    # does not make the box get found. A depth-aware fallback to the next-best
+    # mask is the follow-on fix.
+    min_box_height_mm: float = 15.0
+
+    # Fraction of a mask's valid depth samples that must lie within
+    # +/- box_face_depth_tolerance_mm of its median for the mask to be accepted.
+    #
+    # min_box_height_mm alone is not enough: a mask covering the tray AND the box
+    # averages the two into a plausible height. Capture 2026-08-20_15-12-02 did
+    # exactly this -- 357 x 295 mm of tray+box reported a 674 mm face depth
+    # (between the ~600 mm box top and the ~706 mm tray), clearing the 15 mm bar
+    # at 31 mm.
+    #
+    # A real box top is a single flat plateau, so nearly all of its samples sit
+    # at one depth; a mixed mask is bimodal. This catches the mixed case that the
+    # height gate cannot, while the height gate catches the pure-tray case that
+    # this cannot (a tray-only mask is just as uniform as a box). Both are needed.
+    #
+    # 0.85 is provisional -- set from the depth profiles implied by the reported
+    # face depths, NOT measured from saved depth arrays (only the colour-mapped
+    # PNG is saved, so the raw values could not be recovered). The rejection
+    # message prints the observed fraction: tune this against real numbers from a
+    # few runs before trusting it, and raise it toward ~0.9 if mixed masks still
+    # pass or lower it if good boxes are rejected.
+    min_box_face_depth_uniformity: float = 0.85
+    box_face_depth_tolerance_mm: float = 12.0
+
     # Cardboard-box mask gating & scoring.
     min_box_area_ratio: float = 0.04
     max_box_area_ratio: float = 0.75

@@ -32,9 +32,10 @@ def estimate_box_depth_mm(cfg, box_face_depth_mm):
 
     box_depth = cfg.base_depth_mm - box_face_depth_mm
 
-    if box_depth < 0:
-        box_depth = 0.0
-
+    # NOT clamped to 0. A negative height means the mask sits at or below the
+    # base plane -- it is on the table, not on a box -- and clamping turned that
+    # into a plausible-looking `box_depth_mm: 0` with success: true. The caller
+    # gates on cfg.min_box_height_mm and rejects the detection instead.
     return float(box_depth)
 
 
@@ -117,12 +118,23 @@ def box_face_depth_mm(cfg, depth_roi, mask):
 
     distance_mm, depth_count, mean_depth, min_depth = robust_median_depth(cfg, values)
 
+    # How flat is this mask? A box top is one plateau, so nearly every sample
+    # sits at the median; a mask that has absorbed the tray is bimodal and this
+    # drops sharply. See cfg.min_box_face_depth_uniformity.
+    if values.size > 0 and distance_mm is not None:
+        uniformity = float(
+            np.mean(np.abs(values - distance_mm) <= cfg.box_face_depth_tolerance_mm)
+        )
+    else:
+        uniformity = 0.0
+
     return {
         "distance_mm": distance_mm,
         "depth_count": depth_count,
         "sample_count_total": int(values.size),
         "mean_depth_mm": mean_depth,
         "min_depth_mm": min_depth,
+        "depth_uniformity": uniformity,
     }
 
 
@@ -855,6 +867,32 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
 
     box_face_depth = scaled_depth_result["distance_mm"]
     box_depth = estimate_box_depth_mm(cfg, box_face_depth)
+
+    # Reject a mask that is not standing above the base plane. See
+    # cfg.min_box_height_mm: this is what catches the grasp mechanism's tray
+    # being measured instead of the box.
+    if box_depth is None or box_depth < cfg.min_box_height_mm:
+        print(
+            f"[box] rejected: mask is {box_depth if box_depth is not None else float('nan'):.1f} mm "
+            f"above the base plane (face depth {box_face_depth} mm vs base "
+            f"{cfg.base_depth_mm} mm), below the {cfg.min_box_height_mm} mm minimum "
+            f"-- the mask is on the table, not on a box"
+        )
+        return None
+
+    # Reject a mask spanning two depth populations -- the box top AND the tray
+    # around it -- which averages into a plausible height and defeats the gate
+    # above. See cfg.min_box_face_depth_uniformity.
+    uniformity = scaled_depth_result.get("depth_uniformity", 1.0)
+
+    if uniformity < cfg.min_box_face_depth_uniformity:
+        print(
+            f"[box] rejected: only {uniformity:.1%} of the mask's depth samples are "
+            f"within +/-{cfg.box_face_depth_tolerance_mm:.0f} mm of its {box_face_depth} mm "
+            f"median (need {cfg.min_box_face_depth_uniformity:.0%}) -- the mask spans more "
+            f"than one surface, not a single box face"
+        )
+        return None
 
     center_x_mm, center_y_mm = pixel_to_camera_xy_mm(
         center_full,
