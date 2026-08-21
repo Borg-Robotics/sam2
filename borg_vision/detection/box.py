@@ -138,6 +138,78 @@ def box_face_depth_mm(cfg, depth_roi, mask):
     }
 
 
+def complete_box_mask_to_depth_plateau(cfg, mask, depth_roi, face_depth_mm):
+    """Grow `mask` into every connected pixel lying at `face_depth_mm`.
+
+    SAM2 splits a box top on RGB seams, leaving a mask over part of the face
+    (see cfg.box_plateau_complete_enable). The missing part is at the same depth
+    as the part that was found, so a connected-component pass over the depth
+    plateau recovers it.
+
+    Returns the completed mask, or None when completion does not apply: disabled,
+    no usable depth, the plateau adds nothing, or it grows past
+    cfg.box_plateau_max_area_growth (which means the plateau is not just this
+    box, so the original mask is safer).
+    """
+    if not cfg.box_plateau_complete_enable or face_depth_mm is None:
+        return None
+
+    original_area = int((mask == 1).sum())
+
+    if original_area <= 0:
+        return None
+
+    # Every valid pixel at the same depth as the mask's own face.
+    plateau = (
+        (np.abs(depth_roi.astype(np.float32) - float(face_depth_mm))
+         <= cfg.box_plateau_tolerance_mm)
+        & (depth_roi > cfg.min_valid_depth_mm)
+        & (depth_roi < cfg.max_valid_depth_mm)
+    ).astype(np.uint8)
+
+    # Bridge the stereo dropouts that speckle a real plateau, so one face does
+    # not come back as a dozen disconnected islands.
+    if cfg.box_plateau_close_kernel_px > 1:
+        k = np.ones((cfg.box_plateau_close_kernel_px,) * 2, np.uint8)
+        plateau = cv2.morphologyEx(plateau, cv2.MORPH_CLOSE, k)
+
+    # Keep only the plateau component(s) the mask actually sits on -- an
+    # unrelated surface at the same height elsewhere in the ROI is not this box.
+    count, labels = cv2.connectedComponents(plateau, connectivity=8)
+
+    if count <= 1:
+        return None
+
+    hit = np.unique(labels[(mask == 1) & (labels > 0)])
+
+    if hit.size == 0:
+        return None
+
+    completed = np.isin(labels, hit).astype(np.uint8)
+    completed = ((completed == 1) | (mask == 1)).astype(np.uint8)
+
+    completed_area = int(completed.sum())
+    growth = completed_area / max(original_area, 1)
+
+    if growth < cfg.box_plateau_min_area_growth:
+        return None
+
+    if growth > cfg.box_plateau_max_area_growth:
+        print(
+            f"[box] plateau completion skipped: would grow the mask {growth:.2f}x "
+            f"(cap {cfg.box_plateau_max_area_growth}x) -- the depth plateau extends "
+            f"beyond this box, keeping the original mask"
+        )
+        return None
+
+    print(
+        f"[box] plateau completion: mask grew {growth:.2f}x "
+        f"({original_area} -> {completed_area} px) into the {face_depth_mm} mm face"
+    )
+
+    return completed
+
+
 def axis_overlap_fraction(start_a, size_a, start_b, size_b):
     left = max(start_a, start_b)
     right = min(start_a + size_a, start_b + size_b)
@@ -893,6 +965,34 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
             f"than one surface, not a single box face"
         )
         return None
+
+    # Complete a mask that stopped part-way across the box top, then re-measure
+    # everything from the completed mask. See cfg.box_plateau_complete_enable.
+    completed_mask = complete_box_mask_to_depth_plateau(
+        cfg, box["mask"], depth_roi_scaled, box_face_depth
+    )
+
+    if completed_mask is not None:
+        box = dict(box)
+        box["mask"] = completed_mask
+
+        # estimate_box_dimensions_mm re-derives the rotated rect from
+        # box["mask"], so the dimensions follow the completed mask on their own.
+        # Only the centre has to be recomputed here.
+        completed_center = get_mask_center(completed_mask)
+
+        if completed_center is not None:
+            box["center_roi"] = completed_center
+            center_full = (
+                cfg.roi_x1 + completed_center[0],
+                cfg.roi_y1 + completed_center[1],
+            )
+
+        # Re-measure the face depth over the completed mask: the added area is
+        # the same plateau, but the median is now taken over the whole face.
+        scaled_depth_result = box_face_depth_mm(cfg, depth_roi_scaled, completed_mask)
+        box_face_depth = scaled_depth_result["distance_mm"]
+        box_depth = estimate_box_depth_mm(cfg, box_face_depth)
 
     center_x_mm, center_y_mm = pixel_to_camera_xy_mm(
         center_full,

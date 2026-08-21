@@ -87,6 +87,34 @@ class BoxConfig(BaseConfig):
     min_box_face_depth_uniformity: float = 0.85
     box_face_depth_tolerance_mm: float = 12.0
 
+    # ----- depth-plateau mask completion --------------------------------
+    # Grow an accepted mask into every connected pixel sitting at the same depth
+    # as its own face, then re-measure from the completed mask.
+    #
+    # SAM2 segments in RGB, so a tonal seam across the box top -- a lighting
+    # change, a tape line, a print band -- splits the face and the mask covers
+    # only part of it. Captures 2026-08-21_10-06-57 and 10-07-21 both reported
+    # the SAME box as 200 x 124 mm that had measured 206 x 203 mm minutes
+    # earlier: the mask stopped mid-face. Nothing already in the pipeline caught
+    # it -- a partial box top is still one flat plateau at the right height, so
+    # it passes both min_box_height_mm and min_box_face_depth_uniformity, and
+    # box_merge_split_masks_enable did not fire because SAM2 produced no second
+    # fragment to pair with.
+    #
+    # Depth resolves it unambiguously: the box top is a single continuous
+    # plateau in every one of these frames, and the part the mask missed is the
+    # same depth as the part it caught. This is a REPAIR, not a gate -- it fixes
+    # the measurement rather than rejecting the frame.
+    #
+    # Bounded by box_plateau_max_area_growth so it can only complete a face, not
+    # run away onto a same-height neighbour; growth beyond that is treated as
+    # evidence the plateau is not the box and the original mask is kept.
+    box_plateau_complete_enable: bool = True
+    box_plateau_tolerance_mm: float = 12.0
+    box_plateau_max_area_growth: float = 2.5
+    box_plateau_min_area_growth: float = 1.05
+    box_plateau_close_kernel_px: int = 7
+
     # Cardboard-box mask gating & scoring.
     min_box_area_ratio: float = 0.04
     max_box_area_ratio: float = 0.75
