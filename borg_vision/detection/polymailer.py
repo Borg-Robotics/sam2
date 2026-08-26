@@ -369,7 +369,36 @@ def estimate_product_inside_polymailer(cfg, depth_roi, poly_mask, poly_center_ro
         product_depth_mm = None
         bulge_height_mm = None
 
-    center_roi = get_mask_center(product_mask)
+    # Centre from the TOP of the dome only, not from the half-maximum mask.
+    # product_mask deliberately spans down to half the dome height so it covers
+    # the product's extent, but that band includes the film sloping off the
+    # product, and the slope is rarely symmetric -- its centroid drifts toward
+    # the shallower side and the cup lands off the product. See
+    # cfg.poly_product_center_height_fraction.
+    center_threshold_mm = (
+        baseline_mm + cfg.poly_product_center_height_fraction * dome_mm
+    )
+    center_candidate = (
+        (elevation >= center_threshold_mm) & (product_mask == 1) & well_supported
+    ).astype(np.uint8)
+
+    center_source = "dome_top"
+    center_mask = get_component_near_center(center_candidate, poly_center_roi)
+
+    if center_mask is None or int(center_mask.sum()) == 0:
+        # Nothing survived the top slice (a flat, broad product, or a dome eaten
+        # by dropouts). The half-maximum centroid is the weaker answer but it is
+        # the one this code returned before, so fall back rather than fail.
+        center_mask = product_mask
+        center_source = "half_max_fallback"
+
+    center_roi = get_mask_center(center_mask)
+
+    if center_roi is None:
+        center_roi = get_mask_center(product_mask)
+        center_source = "half_max_fallback"
+
+    # Extent, area and depth all still come from the half-maximum mask.
     bbox = cv2.boundingRect(product_mask.astype(np.uint8))
 
     return {
@@ -382,6 +411,11 @@ def estimate_product_inside_polymailer(cfg, depth_roi, poly_mask, poly_center_ro
         "area_ratio_of_poly": float(area_ratio_of_poly),
         "bbox": bbox,
         "center_roi": center_roi,
+        # "dome_top" when the centre came from the top slice, or
+        # "half_max_fallback" when that slice was empty and the old
+        # half-maximum centroid was used instead.
+        "center_source": center_source,
+        "center_area_px": int(center_mask.sum()),
     }
 
 

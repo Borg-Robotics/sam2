@@ -36,6 +36,14 @@ class PolymailerDetector(BaseDetector):
         if self._mask_generator is None:
             raise RuntimeError("Model not loaded; call load_model() first")
 
+        # Under BORG_TIME_FRAMES=1, report how long the detection itself takes,
+        # so it can be compared against the [frames] line from get_frames.
+        import os
+        import time
+
+        _timed = os.environ.get("BORG_TIME_FRAMES") == "1"
+        _t0 = time.time() if _timed else None
+
         raw = run_sam2_polymailer(
             self.cfg,
             frames.rgb,
@@ -43,6 +51,12 @@ class PolymailerDetector(BaseDetector):
             self._mask_generator,
             self.camera.intrinsics,
         )
+
+        if _timed:
+            print(
+                f"[detect] run_sam2_polymailer {(time.time() - _t0) * 1000:.0f}ms",
+                flush=True,
+            )
 
         if raw is None:
             return None

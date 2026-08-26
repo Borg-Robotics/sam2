@@ -26,6 +26,36 @@ class PolymailerConfig(BaseConfig):
     base_depth_mm: float = 705.0
 
     # Locked ROI.
+    # SAM2 prompt grid, overriding the base 24. Measured 2026-08-24 on 8 saved
+    # captures, scoring each setting's best mask against the mask the running
+    # system produced:
+    #
+    #   pps 24 -> mean IoU 0.993, min 0.963, 8/8 over 0.9, 1.19 s
+    #   pps 16 -> mean IoU 0.986, min 0.963, 8/8 over 0.9, 0.56 s
+    #   pps 12 -> mean IoU 0.991, min 0.965, 8/8 over 0.9, 0.36 s
+    #
+    # Confirmed A/B on the live node the same day, whole-detection timing:
+    #   pps 24 -> 1847 ms then 1633 ms
+    #   pps 12 ->  641 ms then  672 ms
+    #
+    # SET TO 15 by operator preference: segmentation looked visibly better at 24
+    # than at 12 on the table, and 15 is the compromise. Note the IoU benchmark
+    # did NOT detect that difference (0.986-0.993 mean at every setting), which
+    # suggests what improves is WHICH candidate mask the downstream scoring
+    # picks, not the best mask available -- more prompts give the scorer more to
+    # choose from. If that is confirmed, fixing the scoring would be cheaper than
+    # paying for the extra prompts.
+    #
+    # Quality is flat while inference cost falls ~3x: cost scales with the prompt
+    # count (24^2 = 576 prompts, 12^2 = 144), and a polymailer is a large,
+    # high-contrast, well-separated object that does not need a dense grid to
+    # find. Raise this back toward 24 if the mailer is ever MISSED outright --
+    # the failure mode of too few prompts is no candidate at all, not a worse one.
+    #
+    # Polymailer only. Box detection has its own fragility (partial masks on a
+    # banded top face) and was NOT measured here; leave it on the base 24.
+    sam_points_per_side: int = 15
+
     roi_x1: int = 330
     roi_y1: int = 30
     roi_x2: int = 940
@@ -185,6 +215,43 @@ class PolymailerConfig(BaseConfig):
     poly_product_close_frac: float = 1.0
     # Cut at half the dome's own height -- the same relative place on any stock.
     poly_product_height_fraction: float = 0.5
+
+    # Height fraction used for the product CENTER only, as a fraction of the
+    # dome's own height like poly_product_height_fraction above.
+    #
+    # The 0.5 half-maximum contour is the right shape for the product's EXTENT
+    # and for the area gates, but it includes the film sloping off the product,
+    # and that slope is rarely symmetric. Taking the centroid over it pulls the
+    # reported centre toward the shallower side, so the vacuum cup lands off the
+    # product -- the residual error Lorenzo saw on 2026-08-24 after the plane-fit
+    # rewrite fixed the gross cases.
+    #
+    # 0.8 keeps only the top fifth of the dome, where the surface is the product
+    # itself rather than film draping away from it. Extent, area ratio, bbox and
+    # depth all still come from the 0.5 mask; ONLY the centre uses this.
+    #
+    # Falls back to the 0.5 mask's centroid if the top slice is empty or does not
+    # survive the same near-centre component selection.
+    # 0.93, set 2026-08-24 (was 0.8, and 0.5 before the centre was split out).
+    # On the 2026-08-24_09-27-07 capture -- dome baseline -3.8 mm, peak 8.9 mm,
+    # height 12.7 mm -- this lands at ~8.0 mm, the 8-9 mm band Lorenzo asked for:
+    # 6674 px in ONE component, bbox 53 x 57 mm.
+    #
+    # Why a fraction and not a fixed 8 mm: a padded mailer or a flatter product
+    # makes a shorter dome, and a fixed millimetre cut can sit above its peak and
+    # return nothing. This tracks each mailer's own dome.
+    #
+    # Why this high. Sweeping the threshold on that capture, the region stays
+    # near-SQUARE close to the peak (17x16, 38x40, 53x57 mm) and then one axis
+    # runs away -- 73x114, 82x155, 89x191 -- as the film's drape down the
+    # mailer's length enters. That tail is what dragged the centroid off the
+    # product. It appears between 7.5 and 7.0 mm, i.e. below ~0.89.
+    #
+    # NOTE the dome has no flat top: the area grows smoothly at every threshold,
+    # with no plateau. So this recovers the product's CENTRE (the drape is
+    # roughly symmetric about what it covers), not its outline -- the region here
+    # is much smaller than the product itself.
+    poly_product_center_height_fraction: float = 0.93
     poly_product_baseline_percentile: float = 25.0
     poly_product_peak_percentile: float = 99.5
     # Detection gate as a multiple of THIS frame's measured depth noise, so it

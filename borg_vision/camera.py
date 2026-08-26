@@ -106,6 +106,37 @@ def get_rgb_intrinsics(cfg, device):
         return None
 
 
+def _frame_timer():
+    """Stage timer for get_frames, active only under BORG_TIME_FRAMES=1."""
+    import os
+    import time
+
+    if os.environ.get("BORG_TIME_FRAMES") != "1":
+        def _noop(_label=None):
+            return None
+
+        _noop.report = lambda: None
+        return _noop
+
+    start = time.time()
+    marks = []
+    state = {"last": start}
+
+    def _mark(label):
+        now = time.time()
+        marks.append((label, now - state["last"]))
+        state["last"] = now
+
+    def _report():
+        total = time.time() - start
+        parts = "  ".join(f"{lbl} {dt * 1000:.0f}ms" for lbl, dt in marks)
+        print(f"[frames] total {total * 1000:.0f}ms   {parts}", flush=True)
+
+    _mark.report = _report
+    return _mark
+
+
+
 class OakCamera:
     def __init__(self, cfg, mxid=None, needs_measurement_stereo=None):
         self.cfg = cfg
@@ -257,29 +288,49 @@ class OakCamera:
         return self._pipeline is not None and self._pipeline.isRunning()
 
     def get_frames(self):
-        """Block until a fresh frame triple is available and return it aligned."""
+        """Block until a fresh frame triple is available and return it aligned.
+
+        Timing: set the env var BORG_TIME_FRAMES=1 to print a per-stage
+        breakdown. Added 2026-08-24 -- a polymailer detect_polymailer call takes
+        ~3.7 s end to end while SAM2 inference measures only ~0.36 s, so most of
+        the time is elsewhere and this is where to look first. Note every mode on
+        a camera pays for the measurement stereo if ANY mode on it needs one:
+        polymailer reads depth_class_aligned and never touches the measurement
+        stream, but camera_2 also serves box, so the resize+align below still
+        runs on every polymailer call.
+        """
         if self._pipeline is None:
             raise RuntimeError("OakCamera is not open; call open() first")
 
         cfg = self.cfg
 
+        _t = _frame_timer()
+
         rgb_msg = self._rgb_queue.get()
+        _t("rgb_queue.get")
         depth_class_msg = self._depth_class_queue.get()
+        _t("depth_class_queue.get")
 
         rgb = rgb_msg.getCvFrame()
+        _t("rgb.getCvFrame")
 
         depth_class_raw = depth_class_msg.getFrame()
         depth_class_aligned = align_depth_to_rgb(cfg, depth_class_raw)
+        _t("depth_class align")
 
         if self._depth_measure_queue is not None:
             depth_measure_msg = self._depth_measure_queue.get()
+            _t("depth_measure_queue.get")
             depth_measure_raw = depth_measure_msg.getFrame()
             depth_measure_scaled = resize_depth_to_rgb_size(cfg, depth_measure_raw)
             depth_measure_aligned = align_depth_to_rgb(cfg, depth_measure_scaled)
+            _t("depth_measure resize+align")
         else:
             # No dedicated measurement stream: reuse the classification depth so
             # Frames stays the same shape for every mode.
             depth_measure_aligned = depth_class_aligned
+
+        _t.report()
 
         return Frames(
             rgb=rgb,
