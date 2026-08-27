@@ -28,6 +28,29 @@ class ObjectConfig(BaseConfig):
     base_depth_mm: float = 705.0
 
     # Locked ROI (from the polymailer/object script).
+    # SAM2 prompt grid, overriding the base 24. Measured 2026-08-24 on 10 saved
+    # captures, scoring each setting's best mask against the mask the running
+    # system produced:
+    #
+    #   pps 24 -> mean IoU 0.963, min 0.925, 10/10 over 0.9, 1.18 s
+    #   pps 16 -> mean IoU 0.959, min 0.924, 10/10 over 0.9, 0.55 s
+    #   pps 12 -> mean IoU 0.961, min 0.925, 10/10 over 0.9, 0.34 s
+    #   pps  8 -> mean IoU 0.960, min 0.924, 10/10 over 0.9, 0.20 s
+    #
+    # Quality is flat at every setting while cost scales with the prompt count
+    # (24^2 = 576 prompts, 12^2 = 144). Same conclusion as polymailer, which was
+    # A/B'd on the live node at 1847/1633 ms (pps 24) vs 641/672 ms (pps 12).
+    #
+    # Confirmed A/B on the live node the same day, whole-detection timing:
+    #   pps 24 -> 2760 ms then 3045 ms
+    #   pps 12 ->  827 ms then  835 ms
+    # 3.5x slower for quality that does not measurably differ.
+    #
+    # 8 measured just as well but 12 keeps some margin for an object sitting
+    # unusually. The failure mode of too few prompts is the object being MISSED
+    # outright, not segmented worse -- raise this back toward 24 if that happens.
+    sam_points_per_side: int = 15
+
     roi_x1: int = 330
     roi_y1: int = 30
     roi_x2: int = 940

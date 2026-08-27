@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
@@ -97,6 +98,48 @@ class BaseDetector:
             stability_score_thresh=self.cfg.sam_stability_score_thresh,
             min_mask_region_area=self.cfg.sam_min_mask_region_area,
         )
+
+        self._warm_up_inference(device_name)
+
+    def _warm_up_inference(self, device_name):
+        """Run one throwaway inference so the FIRST real detection is not slow.
+
+        Building the model does not initialise CUDA: the context, kernel
+        autotuning and allocator caches all happen on the first forward pass, and
+        that lands on whichever detection happens to be first. Measured on
+        camera_2/polymailer 2026-08-24:
+
+            first  detection: run_sam2_polymailer 1278 ms
+            second detection: run_sam2_polymailer  565 ms
+
+        ~700 ms of pure cold start, paid by the first package of a run. This
+        spends it at load time instead, on a synthetic ROI-sized image.
+
+        Best effort: a failure here costs only the warm-up, so it is logged and
+        swallowed rather than blocking the node from coming up.
+        """
+        if device_name != "cuda":
+            return
+
+        try:
+            height = max(int(self.cfg.roi_y2 - self.cfg.roi_y1), 64)
+            width = max(int(self.cfg.roi_x2 - self.cfg.roi_x1), 64)
+
+            # Mid-grey rather than zeros: a flat black frame can be rejected
+            # before the heavy path runs, which would defeat the point.
+            dummy = np.full((height, width, 3), 128, dtype=np.uint8)
+
+            start = time.time()
+
+            with torch.inference_mode():
+                self._mask_generator.generate(dummy)
+
+            print(
+                f"SAM 2 warm-up inference: {(time.time() - start) * 1000:.0f}ms "
+                f"({width}x{height})"
+            )
+        except Exception as exc:  # noqa: BLE001 - warm-up must never be fatal
+            print(f"SAM 2 warm-up inference skipped: {exc}")
 
     def open(self):
         # No-op for a shared camera; the owner opens it once.
