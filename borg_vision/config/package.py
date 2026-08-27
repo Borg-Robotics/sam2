@@ -188,12 +188,15 @@ class PackageConfig(BaseConfig):
     min_surface_depth_count: int = 30
 
     # ----- product-inside (polymailer) detection -----------------------
-    # The mailer drapes over the product, so depth shows a smooth DOME, not a
-    # slab with edges. Amplitude varies with mailer stock (a padded mailer
-    # spreads the same product into a ~5 mm dome where kraft gives ~10 mm), so
-    # every geometric knob below is RELATIVE -- a fraction of the dome's own
-    # height or of the package's own size -- and adapts per frame. The only
-    # absolute values left are the sanity rails at the bottom.
+    # The mailer drapes and tents over the product, so depth shows a smooth
+    # DOME whose skirt extends well past the product -- and trapped air can
+    # hold the film HIGHER than the product itself, so no height threshold can
+    # outline it. The detector instead finds the flat PLANAR patch where the
+    # film rests on the rigid product's top (the seed), fits that plane, and
+    # grows the footprint across everything close to the plane. Length knobs
+    # are RELATIVE (fractions of the package span or the dome height); the
+    # plane tolerances are millimetres because they describe how far film can
+    # physically sit from a rigid top it is touching.
     product_inside_enable: bool = True
 
     # Border band excluded from the search, as a fraction of the package span
@@ -225,64 +228,95 @@ class PackageConfig(BaseConfig):
     # the measured height and makes large products look like weak ones.
     product_inside_baseline_percentile: float = 25.0
 
-    # Footprint = everything at least this fraction of the dome height. 0.5 is
-    # the half-maximum contour: scale-free, so it lands in the same relative
-    # place on a 5 mm padded dome and a 10 mm kraft dome.
-    product_inside_height_fraction: float = 0.5
-
     # The measurement stereo drops out in streaks over low-texture kraft. A
     # pixel with no reading of its own is still usable when enough of the
     # smoothing kernel around it landed on valid depth; this is that minimum
     # (as a fraction of the kernel). Raise it to trust interpolation less.
     product_inside_min_blur_support: float = 0.25
 
-    # Closing kernel that rejoins a dome fragmented by those dropout streaks,
-    # as a fraction of the smoothing scale (so it too follows package size).
-    product_inside_close_frac: float = 1.0
+    # ----- seed: where the product's top is looked for ------------------
+    # Height CANNOT outline the product (the drape reaches every height the
+    # product does; trapped air even holds the film higher than the product),
+    # so height only gates where SEEDS may start: at least this fraction of
+    # the dome height up.
+    product_inside_seed_min_height_frac: float = 0.35
 
-    # Trims thin tapering appendages off the footprint, as a fraction of the
-    # blob's own span. Where the mailer runs off the product it keeps sloping,
-    # and that ramp can hold above the half-max cut for a long way while staying
-    # narrow -- a spur that is drape, not product. Judged on width rather than
-    # height because the ramp reaches the same elevations the genuine far side
-    # of the dome does; only its cross-section gives it away. 0 disables.
-    product_inside_trim_frac: float = 0.18
+    # Within that elevated zone, the seed is its flattest part: pixels whose
+    # smoothed-elevation slope is under this percentile of the zone's own
+    # slopes. Film resting on a rigid product is flat; drape is sloped.
+    product_inside_seed_slope_percentile: float = 30.0
 
-    # ----- product CORE (the reported centre) --------------------------
-    # The footprint above is the whole raised region, drape shoulders included;
-    # it is deliberately generous because a mailer's creases and slope make the
-    # true product outline unsegmentable. Its centroid is therefore pulled
-    # around by however the sheet happens to fall. The core is the crown of the
-    # dome -- the part most likely to be over the product itself -- and is what
-    # the reported centre and depth are taken from.
-    #
-    # The core keeps the part of the footprint that is NOT sloping. Where the
-    # mailer runs off the product it descends continuously, and that slope makes
-    # up most of the footprint's area -- so a centroid over the whole footprint,
-    # or over any contour of it, is really measuring the drape.
-    #
-    # Cut is relative to the slope found in this frame's own footprint (a
-    # fraction of its 90th-percentile gradient), so nothing here is a fixed
-    # millimetre or a fixed direction. Checked against three hand-outlined
-    # captures it roughly halved the centre error, 59 mm -> 28 mm.
-    product_inside_core_max_slope_frac: float = 0.25
+    # A seed component must be at least this fraction of the package area;
+    # of those, the largest is tried first (up to seed_max_candidates).
+    product_inside_seed_min_area_frac: float = 0.005
+    product_inside_seed_max_candidates: int = 3
 
-    # Opening applied to the core, as a fraction of its own span.
-    product_inside_core_open_frac: float = 0.10
+    # ----- plane growth: the footprint --------------------------------
+    # A tilted plane is fitted to the seed (the product's top) and the seed
+    # grows across everything close to that plane. ASYMMETRIC on purpose:
+    # drape leaves the product plane UPWARD (tent, billow), so above-plane is
+    # tight; film sags BELOW the plane off edges and corners, so below-plane
+    # is looser. Loosening the above-tolerance is what re-admits the drape.
+    product_inside_plane_tol_above_mm: float = 0.6
+    product_inside_plane_tol_below_mm: float = 1.2
 
+    # Closing applied to the on-plane zone before growth (bridges dropout
+    # streaks and small contact gaps), as a fraction of the smoothing scale.
+    product_inside_grow_close_frac: float = 0.75
 
-    # If the crown comes out smaller than this share of the footprint the dome
-    # has no usable top, and the centre falls back to the footprint.
-    product_inside_core_min_frac_of_blob: float = 0.02
+    # Growth is geodesically capped at this multiple of the seed's own span
+    # (sqrt of its area): an on-plane band that merely osculates the curved
+    # drape would otherwise run across the whole mailer.
+    product_inside_grow_dist_seed_spans: float = 1.5
+
+    # Trims thin tapering appendages off the grown footprint, as a fraction of
+    # the blob's own span. Where the drape happens to lie in the product's
+    # plane it forms a narrow tongue -- drape, not product; only its
+    # cross-section gives it away. 0 disables.
+    product_inside_trim_frac: float = 0.10
+
+    # ----- peak candidate ----------------------------------------------
+    # A second candidate seeded from the dome's very top. When the drape forms
+    # a long level crest, the flat path rides it -- but the product still owns
+    # the dome's peak (nothing rests ON a drape). The band is how far below
+    # the p99.5 elevation the seed may reach; the growth cap is tighter than
+    # the flat path's because the peak plane necessarily skims the crest
+    # crown. The two candidates compete on edge-drop x solidity x aspect;
+    # aspect is referenced to score_aspect_ref so a genuinely elongated
+    # product (2:1) is not penalised.
+    product_inside_peak_band_mm: float = 0.4
+    product_inside_peak_grow_dist_spans: float = 0.7
+    product_inside_score_aspect_ref: float = 2.0
+
+    # ----- edge-drop gate: does anything rigid end here? ----------------
+    # Around a rigid product the film must FALL off the plane. The drop is
+    # measured in a ring around the footprint, offset by edge_band_frac of the
+    # package span (the smoothing spreads the cliff), and a ring pixel counts
+    # when it is below the plane by max(edge_drop_mm_min, edge_drop_dome_frac
+    # of the dome height). Less than min_edge_drop_frac of the ring dropping
+    # means no rigid edges: found=False rather than a guessed centre.
+    product_inside_edge_band_frac: float = 0.035
+    product_inside_edge_drop_mm_min: float = 2.0
+    product_inside_edge_drop_dome_frac: float = 0.15
+    product_inside_min_edge_drop_frac: float = 0.35
+
+    # ----- footprint shape gates ---------------------------------------
+    # A rigid product's footprint is compact. Solidity (area over convex hull
+    # area) is the primary gate -- it is rotation-invariant. Rect fill (area
+    # over rotated-bbox area) is only a backstop: a rotated product in an
+    # axis-aligned minAreaRect legitimately fills as little as half of it.
+    product_inside_min_solidity: float = 0.72
+    product_inside_min_rect_fill: float = 0.40
 
     # Detection gate, expressed in multiples of the frame's own measured depth
     # noise rather than in mm.
     product_inside_min_peak_noise_multiple: float = 3.0
 
     # Sanity rails (absolute, deliberately wide -- these reject nonsense, they
-    # do not tune the estimate).
+    # do not tune the estimate). The max area ratio doubles as the drape
+    # sanity gate: a "product" covering nearly half the mailer is the drape.
     product_inside_min_area_ratio_of_package: float = 0.02
-    product_inside_max_area_ratio_of_package: float = 0.80
+    product_inside_max_area_ratio_of_package: float = 0.45
     product_inside_min_valid_pixels: int = 80
     product_inside_max_peak_mm: float = 90.0
 

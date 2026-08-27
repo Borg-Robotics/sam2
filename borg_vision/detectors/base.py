@@ -211,6 +211,10 @@ class BaseDetector:
         if self._mask_generator is None:
             raise RuntimeError("Model not loaded; call load_model() first")
 
+        # Cleared per call so save_rejection() can never write a stale frame
+        # from an earlier failure. See save_rejection.
+        self.last_frames = None
+
         if self.requires_barcode:
             scan = self.scan_barcode(
                 timeout_s, should_abort=should_abort, on_frame=on_frame
@@ -218,14 +222,63 @@ class BaseDetector:
             if scan is None:
                 return None
             barcode, frames = scan
+            self.last_frames = frames
             return self.detect(frames, barcode)
 
         if should_abort is not None and should_abort():
             return None
         frames = self.camera.get_frames()
+        self.last_frames = frames
         if on_frame is not None:
             on_frame(frames, None)
         return self.detect(frames, None)
+
+    def save_rejection(self, out_dir, reason=""):
+        """Write the frame a FAILED detection was made on.
+
+        The node returns early when detect() gives None, so the normal
+        save_debug() path never runs and a rejection leaves nothing on disk --
+        exactly when the image is most worth looking at. This writes the raw RGB
+        and both depth ROIs into a <timestamp>_rejected folder, kept separate so
+        a failure is never mistaken for a good capture.
+
+        Returns the dict of written paths, or None when there is no frame.
+        """
+        frames = getattr(self, "last_frames", None)
+
+        if frames is None:
+            return None
+
+        cfg = self.cfg
+        save_dir = Path(out_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        written = {"dir": save_dir, "reason": reason}
+
+        raw_path = save_dir / "raw_rgb.jpg"
+        cv2.imwrite(str(raw_path), frames.rgb)
+        written["raw_rgb"] = raw_path
+
+        for attr, name in (("depth_measure_aligned", "depth_roi_mm"),
+                           ("depth_class_aligned", "depth_class_roi_mm")):
+            depth = getattr(frames, attr, None)
+            if depth is None:
+                continue
+            roi = depth[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2]
+            path = save_dir / (name + ".png")
+            cv2.imwrite(str(path), roi.astype(np.uint16))
+            written[name] = path
+
+        info = {
+            "rejected": True,
+            "reason": reason,
+            "roi": [cfg.roi_x1, cfg.roi_y1, cfg.roi_x2, cfg.roi_y2],
+        }
+        json_path = save_dir / "rejection.json"
+        json_path.write_text(json.dumps(info, indent=2))
+        written["rejection"] = json_path
+
+        return written
 
     # ---------------------------------------------------------- visualization
 

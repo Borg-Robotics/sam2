@@ -2316,16 +2316,64 @@ def fit_reference_plane(
     return (coeffs[0] * grid_x + coeffs[1] * grid_y + coeffs[2]).astype(np.float32)
 
 
+def geodesic_grow(seed_u8, allowed_u8, max_dist_px, step=4):
+    """Dilate seed within allowed, up to ~max_dist_px (approximate geodesic).
+
+    Runs inside the seed's bounding window (padded by max_dist) -- growth
+    cannot escape it, and the crop keeps the dilation loop cheap.
+    """
+    ys, xs = np.where(seed_u8 == 1)
+
+    if ys.size == 0:
+        return np.zeros_like(seed_u8)
+
+    pad = int(np.ceil(max_dist_px)) + step + 1
+    y1 = max(0, int(ys.min()) - pad)
+    y2 = min(seed_u8.shape[0], int(ys.max()) + pad + 1)
+    x1 = max(0, int(xs.min()) - pad)
+    x2 = min(seed_u8.shape[1], int(xs.max()) + pad + 1)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (step * 2 + 1, step * 2 + 1))
+    allowed_win = allowed_u8[y1:y2, x1:x2]
+    cur = (seed_u8[y1:y2, x1:x2] & allowed_win).astype(np.uint8)
+
+    for _ in range(max(1, int(round(max_dist_px / step)))):
+        nxt = cv2.dilate(cur, kernel) & allowed_win
+
+        if int(nxt.sum()) == int(cur.sum()):
+            break
+
+        cur = nxt
+
+    out = np.zeros_like(seed_u8)
+    out[y1:y2, x1:x2] = cur
+
+    return out
+
+
 def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_depth_mm, intrinsics):
     """Locate the product inside a polymailer from its depth signature.
 
-    The mailer is not rigid: it drapes over whatever is inside, so depth shows a
-    smooth dome with sloped shoulders rather than an object with edges. There is
-    no true boundary to threshold, and the dome's height depends on the mailer
-    stock (padding spreads the same product into a lower, broader dome). So the
-    estimate is built entirely from ratios: the reference surface is fitted per
-    frame, the cut is a fraction of the dome's own height, and the detection
-    gate is a multiple of the frame's own depth noise.
+    The mailer is not rigid: it drapes and tents over whatever is inside, so
+    depth shows a smooth dome whose sloped skirt extends well past the product,
+    and trapped air can hold the film HIGHER than the product itself. No height
+    threshold can separate product from drape (the drape reaches every height
+    the product does), so the estimate is built around the one thing only a
+    rigid product produces: a large PLANAR patch where the film rests on its
+    top.
+
+    Pipeline: fit the mailer reference surface and gate on the dome as before;
+    seed from the flattest part of the elevated region; fit a tilted plane to
+    that seed (the product's top); grow the seed across everything close to
+    that plane (tight above -- drape hovers above the plane, loose below --
+    film can sag off edges and corners), with the growth geodesically capped
+    near the seed so a band osculating the curved drape cannot run away; trim
+    drape tongues on width; merge film pockets bulging above the plane that
+    are enclosed by the contact region (air trapped over the product's own
+    middle); then report the rotated-rectangle fit of the result. Gates on
+    edge drop (a rigid product's surroundings must fall off the plane),
+    solidity, and area keep an unreadable or absent product reported as
+    found=False rather than as a guessed centre.
     """
     empty = {
         "found": False,
@@ -2345,6 +2393,14 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         "noise_mm": None,
         "peak_noise_multiple": None,
         "threshold_mm": None,
+        "rect_w_mm": None,
+        "rect_h_mm": None,
+        "rect_angle_deg": None,
+        "edge_drop_frac": None,
+        "rect_fill": None,
+        "solidity": None,
+        "center_source": None,
+        "candidate_score": None,
     }
 
     if not cfg.product_inside_enable:
@@ -2430,172 +2486,390 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         empty["reason"] = "no_dome_above_noise"
         return empty
 
-    # Half-maximum contour of the dome. Being a fraction of the dome's own
-    # height, it lands in the same relative place whatever the mailer stock.
-    threshold_mm = baseline_mm + cfg.product_inside_height_fraction * dome_mm
-    empty["threshold_mm"] = threshold_mm
-
-    # Candidacy is judged on the smoothed field over the whole inner region, not
-    # only where a pixel had its own depth reading. The measurement stereo drops
-    # out in streaks over low-texture kraft (~8% of the mailer on a typical
-    # capture), and requiring per-pixel validity let every one of those streaks
-    # punch a notch into the product. The blur already interpolates across a
-    # dropout smaller than its kernel; `support` is what says whether it could.
+    # The measurement stereo drops out in streaks over low-texture kraft; a
+    # pixel is usable where enough of the smoothing kernel around it landed on
+    # valid depth.
     well_supported = support >= cfg.product_inside_min_blur_support
-    product_candidate = (
-        (elevation >= threshold_mm) & (inner_mask == 1) & well_supported
-    ).astype(np.uint8)
+    grow_zone = (inner_mask == 1) & well_supported
 
-    # Opening at a fraction of the smoothing scale drops speckle without the
-    # close+dilate that used to inflate a sparse scatter into a solid blob.
-    open_px = max(1, int(round(smooth_px * 0.5)))
-    product_candidate = cv2.morphologyEx(
-        product_candidate,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_px * 2 + 1, open_px * 2 + 1)),
-    )
-
-    # Close before picking the component, so a dome broken into fragments by a
-    # dropout streak is rejoined rather than having all but its biggest piece
-    # thrown away. Kernel is relative to the smoothing scale, so it stays tied
-    # to the package's own size.
-    close_px = max(1, int(round(smooth_px * cfg.product_inside_close_frac)))
-    product_candidate = cv2.morphologyEx(
-        product_candidate,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)),
-    )
-
-    product_candidate = largest_component(product_candidate)
-
-    if product_candidate is None:
-        empty["reason"] = "no_component"
-        return empty
-
-    product_area = int(product_candidate.sum())
-
-    # Trim thin spurs. Where the mailer runs off the edge of the product it
-    # keeps sloping, and that ramp can stay above the half-max cut well past the
-    # product while remaining narrow. It cannot be told apart by height -- it
-    # reaches the same elevations the real far side of the dome does -- so it is
-    # cut on width instead. Opening by reconstruction is no use here: the spur
-    # tapers continuously into the body rather than joining it at a neck, so a
-    # reconstruction just re-grows it.
-    if cfg.product_inside_trim_frac > 0.0:
-        trim_px = max(1, int(round(np.sqrt(product_area) * cfg.product_inside_trim_frac)))
-        trimmed = cv2.morphologyEx(
-            product_candidate,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (trim_px * 2 + 1, trim_px * 2 + 1)),
-        )
-        trimmed = largest_component(trimmed)
-
-        # Only accept the trim if something survived it; a dome thinner than the
-        # kernel in every direction should be reported as it is, not deleted.
-        if trimmed is not None and int(trimmed.sum()) > 0:
-            product_candidate = trimmed
-
-    # Anything still enclosed is interior: fill it so the result is one solid
-    # region. Filled pixels carry no weight in the centroid below (their
-    # elevation is under the threshold), so this changes the reported footprint
-    # without moving the reported centre.
-    product_candidate = fill_mask_holes(product_candidate)
-
-    product_area = int(product_candidate.sum())
-    area_ratio = product_area / max(package_area, 1)
-
-    if area_ratio < cfg.product_inside_min_area_ratio_of_package:
-        empty["reason"] = "too_small"
-        empty["mask"] = product_candidate
-        empty["area_px"] = product_area
-        empty["area_ratio_of_package"] = float(area_ratio)
-        return empty
-
-    if area_ratio > cfg.product_inside_max_area_ratio_of_package:
-        empty["reason"] = "too_large"
-        empty["mask"] = product_candidate
-        empty["area_px"] = product_area
-        empty["area_ratio_of_package"] = float(area_ratio)
-        return empty
-
-    selected = product_candidate == 1
-
-    # The footprint is the whole raised region, drape shoulders and all, and the
-    # shoulders are most of its area -- so its centroid answers "where is the
-    # bulge", not "where is the product". The product is what the sheet is
-    # resting ON, which is the part that is not sloping; everywhere the mailer
-    # runs off the product it descends continuously.
-    #
-    # So the core is the footprint with the sloping part removed. The cut is a
-    # fraction of the slope present in this frame's own footprint, which keeps
-    # it free of both fixed millimetres and any assumed direction.
     grad_x = cv2.Sobel(elevation, cv2.CV_32F, 1, 0, ksize=5) / 8.0
     grad_y = cv2.Sobel(elevation, cv2.CV_32F, 0, 1, ksize=5) / 8.0
     slope = np.sqrt(grad_x * grad_x + grad_y * grad_y)
 
-    slope_reference = float(np.percentile(slope[selected], 90.0))
-    max_slope = cfg.product_inside_core_max_slope_frac * slope_reference
+    # ----- seed: the flattest part of the raised region ----------------
+    # The film on the product's top is the flattest thing standing above the
+    # mailer surface. Height alone CANNOT gate the footprint (drape billows
+    # reach the same heights), so height only picks where seeds may start.
+    seed_threshold_mm = baseline_mm + cfg.product_inside_seed_min_height_frac * dome_mm
+    empty["threshold_mm"] = seed_threshold_mm
 
-    core = (selected & (slope <= max_slope)).astype(np.uint8)
+    elevated = grow_zone & valid_inner & (elevation >= seed_threshold_mm)
 
-    core_open_px = max(1, int(round(np.sqrt(max(int(core.sum()), 1))
-                                    * cfg.product_inside_core_open_frac)))
-    core = cv2.morphologyEx(
-        core,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_open_px * 2 + 1, core_open_px * 2 + 1)),
-    )
-
-    core = largest_component(core)
-
-    if core is not None:
-        core = fill_mask_holes(core)
-
-    core_ok = (
-        core is not None
-        and int(core.sum()) >= cfg.product_inside_core_min_frac_of_blob * product_area
-    )
-
-    if core_ok:
-        centre_source = core == 1
-        core_area = int(core.sum())
-    else:
-        # Nothing in the footprint was flat enough to read as supported: the
-        # whole bulge is slope. Fall back to the footprint rather than report
-        # nothing, and say so via core_found.
-        core = np.zeros_like(product_candidate)
-        centre_source = selected
-        core_area = 0
-
-    yy, xx = np.where(centre_source)
-
-    if yy.size == 0:
-        empty["reason"] = "no_center"
-        empty["mask"] = product_candidate
-        empty["area_px"] = product_area
-        empty["area_ratio_of_package"] = float(area_ratio)
+    if int(elevated.sum()) < cfg.product_inside_min_valid_pixels:
+        empty["reason"] = "no_seed"
         return empty
 
-    cx_roi = float(xx.mean())
-    cy_roi = float(yy.mean())
-    center_full = (int(round(cfg.roi_x1 + cx_roi)), int(round(cfg.roi_y1 + cy_roi)))
+    slope_thr = float(
+        np.percentile(slope[elevated], cfg.product_inside_seed_slope_percentile)
+    )
+    seed = (elevated & (slope <= slope_thr)).astype(np.uint8)
+    seed_open_px = max(2, int(round(smooth_px * 0.25)))
+    seed = cv2.morphologyEx(
+        seed,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (seed_open_px * 2 + 1, seed_open_px * 2 + 1)
+        ),
+    )
 
-    # Depth comes from the same core. Averaging over the whole footprint would
-    # run down the dome's shoulders and report the product as deeper than it is.
-    supported = centre_source
+    n_seeds, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(seed, 8)
+    min_seed_area = cfg.product_inside_seed_min_area_frac * package_area
+    cand_ids = [i for i in range(1, n_seeds) if seed_stats[i, 4] >= min_seed_area]
+    cand_ids = sorted(cand_ids, key=lambda i: -seed_stats[i, 4])
+    cand_ids = cand_ids[: cfg.product_inside_seed_max_candidates]
 
-    if int(supported.sum()) < cfg.min_surface_depth_count:
-        supported = selected
+    if not cand_ids:
+        empty["reason"] = "no_seed"
+        return empty
 
-    product_values = depth_roi[
-        supported
+    grid_y, grid_x = np.indices(elevation.shape)
+
+    def fit_patch_plane(mask_b):
+        """Tilted plane through the smoothed elevation of a pixel set."""
+        ys, xs = np.where(mask_b)
+
+        if len(xs) > 12000:
+            idx = np.random.default_rng(0).choice(len(xs), 12000, replace=False)
+            xs, ys = xs[idx], ys[idx]
+
+        e = elevation[ys, xs].astype(np.float64)
+        a = np.column_stack([xs, ys, np.ones(len(xs))]).astype(np.float64)
+        coeffs, _, _, _ = np.linalg.lstsq(a, e, rcond=None)
+
+        residual = e - a @ coeffs
+        keep = np.abs(residual - np.median(residual)) < 2.0 * max(float(np.std(residual)), 0.05)
+
+        if int(keep.sum()) > 32:
+            coeffs, _, _, _ = np.linalg.lstsq(a[keep], e[keep], rcond=None)
+
+        return (coeffs[0] * grid_x + coeffs[1] * grid_y + coeffs[2]).astype(np.float32)
+
+    close_px = max(1, int(round(smooth_px * cfg.product_inside_grow_close_frac)))
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)
+    )
+    band_px = max(4, int(round(package_span_px * cfg.product_inside_edge_band_frac)))
+    band_in_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (band_px * 2 + 1, band_px * 2 + 1)
+    )
+    band_out_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (band_px * 6 + 1, band_px * 6 + 1)
+    )
+    drop_thr_mm = max(
+        cfg.product_inside_edge_drop_mm_min,
+        cfg.product_inside_edge_drop_dome_frac * dome_mm,
+    )
+
+    def build_candidate(patch_u8, dist_spans, source):
+        """Grow one seed into a footprint candidate and measure its quality."""
+        max_dist = dist_spans * float(np.sqrt(int(patch_u8.sum())))
+
+        plane_fit = fit_patch_plane(patch_u8 == 1)
+        region = None
+
+        # Grow across everything near the seed's plane, refit on the grown
+        # region once, and grow again. Tolerance is ASYMMETRIC: the drape
+        # leaves the product plane upward (tent, billow), so above-plane is
+        # tight; film sags below the plane off edges and corners, so
+        # below-plane is looser. The geodesic cap keeps a band that happens to
+        # osculate the curved drape from running across the mailer.
+        prev_area = int(patch_u8.sum())
+
+        for _ in range(2):
+            on_plane = (
+                grow_zone
+                & valid_inner
+                & (elevation - plane_fit <= cfg.product_inside_plane_tol_above_mm)
+                & (plane_fit - elevation <= cfg.product_inside_plane_tol_below_mm)
+            ).astype(np.uint8)
+            on_plane = cv2.morphologyEx(on_plane, cv2.MORPH_CLOSE, close_kernel)
+
+            region_u8 = geodesic_grow(patch_u8, on_plane, max_dist)
+
+            if int(region_u8.sum()) == 0:
+                return None
+
+            region = region_u8
+            plane_fit = fit_patch_plane(region == 1)
+
+            # Converged: the refit will not move a region that barely changed.
+            if abs(int(region.sum()) - prev_area) < 0.05 * prev_area:
+                break
+
+            prev_area = int(region.sum())
+
+        # Width-based spur trim first: drape tongues must go before the
+        # trapped-air test, or a pocket beside a tongue reads as enclosed. ALL
+        # sizable pieces are kept (not just the largest): a thin contact ring
+        # may be cut into limbs here and is rejoined by the pocket merge below.
+        if cfg.product_inside_trim_frac > 0.0:
+            trim_px = max(
+                1, int(round(np.sqrt(int(region.sum())) * cfg.product_inside_trim_frac))
+            )
+            opened = cv2.morphologyEx(
+                region,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (trim_px * 2 + 1, trim_px * 2 + 1)
+                ),
+            )
+
+            if int(opened.sum()) > 0:
+                n_pieces, piece_labels, piece_stats, _ = cv2.connectedComponentsWithStats(
+                    opened, 8
+                )
+                keep_min = max(
+                    cfg.product_inside_min_valid_pixels, int(0.05 * int(opened.sum()))
+                )
+                pieces = [
+                    j for j in range(1, n_pieces) if piece_stats[j, 4] >= keep_min
+                ]
+
+                if pieces:
+                    region = np.isin(piece_labels, pieces).astype(np.uint8)
+
+        # Trapped air: the film can bulge ABOVE the product plane over the
+        # product's own middle, leaving only a contact ring on the plane.
+        # Merge above-plane blobs whose wide surrounding ring is mostly this
+        # region -- a pocket enclosed by product contact is product; a billow
+        # off to one side is not.
+        above = (
+            grow_zone
+            & valid_inner
+            & (elevation - plane_fit > cfg.product_inside_plane_tol_above_mm)
+        ).astype(np.uint8)
+        n_blobs, blob_labels, blob_stats, _ = cv2.connectedComponentsWithStats(above, 8)
+        air_ring_px = max(9, int(round(band_px * 1.5)))
+        air_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (air_ring_px * 2 + 1, air_ring_px * 2 + 1)
+        )
+
+        for j in range(1, n_blobs):
+            blob_area = int(blob_stats[j, 4])
+
+            if blob_area < 100 or blob_area > 2 * int(region.sum()):
+                continue
+
+            # Work in the blob's padded bounding window; a full-frame dilate
+            # per blob dominated the whole detector's runtime.
+            bx, by, bw, bh = blob_stats[j, 0], blob_stats[j, 1], blob_stats[j, 2], blob_stats[j, 3]
+            y1 = max(0, by - air_ring_px - 1)
+            y2 = min(region.shape[0], by + bh + air_ring_px + 1)
+            x1 = max(0, bx - air_ring_px - 1)
+            x2 = min(region.shape[1], bx + bw + air_ring_px + 1)
+
+            blob_win = (blob_labels[y1:y2, x1:x2] == j).astype(np.uint8)
+            ring_win = (cv2.dilate(blob_win, air_kernel) == 1) & (blob_win == 0)
+            n_ring = int(ring_win.sum())
+
+            if n_ring == 0:
+                continue
+
+            if float((ring_win & (region[y1:y2, x1:x2] == 1)).sum()) / n_ring >= 0.8:
+                region[y1:y2, x1:x2] |= blob_win
+
+        region = fill_mask_holes(region)
+        biggest = largest_component(region)
+
+        if biggest is not None and int(biggest.sum()) > 0:
+            region = fill_mask_holes(biggest)
+
+        product_area = int(region.sum())
+
+        if product_area < cfg.product_inside_min_valid_pixels:
+            return None
+
+        ys, xs = np.where(region == 1)
+        points = np.column_stack([xs, ys]).astype(np.float32)
+        rect = cv2.minAreaRect(points)
+        (rect_cx, rect_cy), (rect_w, rect_h), rect_angle = rect
+        rect_fill = product_area / max(rect_w * rect_h, 1.0)
+        aspect = max(rect_w, rect_h) / max(min(rect_w, rect_h), 1.0)
+        hull = cv2.convexHull(points)
+        solidity = product_area / max(float(cv2.contourArea(hull)), 1.0)
+
+        # Ring OUTSIDE the region, offset one band width: the smoothing spreads
+        # the fall-off, so the drop is measured past the immediate boundary.
+        # Computed in the region's padded window -- the outer kernel is large
+        # and a full-frame dilate with it is most of the candidate's cost.
+        pad = band_px * 3 + 2
+        ry1 = max(0, int(ys.min()) - pad)
+        ry2 = min(region.shape[0], int(ys.max()) + pad + 1)
+        rx1 = max(0, int(xs.min()) - pad)
+        rx2 = min(region.shape[1], int(xs.max()) + pad + 1)
+        region_win = region[ry1:ry2, rx1:rx2]
+        ring = (
+            (cv2.dilate(region_win, band_out_kernel) == 1)
+            & (cv2.dilate(region_win, band_in_kernel) == 0)
+            & valid_inner[ry1:ry2, rx1:rx2]
+        )
+
+        if int(ring.sum()) < 30:
+            return None
+
+        edge_drop_frac = float(
+            ((plane_fit[ry1:ry2, rx1:rx2] - elevation[ry1:ry2, rx1:rx2])[ring] > drop_thr_mm).mean()
+        )
+
+        # Candidate quality: rigid edges all round, compact, not a drape band.
+        # The aspect term is soft -- genuinely elongated products exist -- and
+        # referenced to score_aspect_ref so a 2:1 product is not penalised.
+        score = (
+            edge_drop_frac
+            * solidity
+            * min(1.0, cfg.product_inside_score_aspect_ref / max(aspect, 1e-3)) ** 0.5
+        )
+
+        return {
+            "patch": patch_u8,
+            "region": region,
+            "source": source,
+            "area": product_area,
+            "rect": rect,
+            "fill": rect_fill,
+            "solidity": solidity,
+            "drop_frac": edge_drop_frac,
+            "area_ratio": product_area / package_area,
+            "score": score,
+        }
+
+    candidates = []
+
+    # FLAT candidate: seeds tried largest-first, first that grows a usable
+    # region wins -- the dominant flat patch is the product's contact area.
+    for i in cand_ids:
+        cand = build_candidate(
+            (seed_labels == i).astype(np.uint8),
+            cfg.product_inside_grow_dist_seed_spans,
+            "flat",
+        )
+
+        if cand is not None:
+            candidates.append(cand)
+            break
+
+    # PEAK candidate: the top of the dome. When the drape forms a long level
+    # crest, the flat path rides it -- but the product still owns the dome's
+    # peak (nothing rests ON a drape). Grown with a tighter cap because its
+    # plane necessarily skims the crest crown. Skipped when a COMPACT flat
+    # region already covers the peak (then both candidates describe the same
+    # bump and the second growth pass would be pure cost) -- an elongated band
+    # can cover the peak while centring far from it, so it never skips.
+    peak_band = (
+        grow_zone
+        & valid_inner
+        & (elevation >= peak_mm - cfg.product_inside_peak_band_mm)
+    ).astype(np.uint8)
+    peak_band = cv2.morphologyEx(
+        peak_band,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    n_pk, pk_labels, pk_stats, _ = cv2.connectedComponentsWithStats(peak_band, 8)
+
+    if n_pk > 1:
+        j = max(range(1, n_pk), key=lambda j: pk_stats[j, 4])
+        pk_patch = (pk_labels == j).astype(np.uint8)
+
+        skip_peak = False
+
+        if candidates:
+            covered = float((candidates[0]["region"] & pk_patch).sum()) / max(
+                int(pk_patch.sum()), 1
+            )
+            (_, (fw, fh), _) = candidates[0]["rect"]
+            flat_aspect = max(fw, fh) / max(min(fw, fh), 1.0)
+            skip_peak = (
+                covered >= 0.6
+                and flat_aspect <= cfg.product_inside_score_aspect_ref
+            )
+
+        if pk_stats[j, 4] >= cfg.product_inside_min_valid_pixels and not skip_peak:
+            cand = build_candidate(
+                pk_patch,
+                cfg.product_inside_peak_grow_dist_spans,
+                "peak",
+            )
+
+            if cand is not None:
+                candidates.append(cand)
+
+    best = max(candidates, key=lambda c: c["score"]) if candidates else None
+
+    if best is None:
+        empty["reason"] = "no_component"
+        return empty
+
+    (rect_cx, rect_cy), (rect_w, rect_h), rect_angle = best["rect"]
+
+    mm_per_px = None
+
+    if center_full_depth_mm is not None and intrinsics is not None:
+        mm_per_px = float(center_full_depth_mm) / float(intrinsics["fx"])
+
+    empty["area_px"] = best["area"]
+    empty["area_ratio_of_package"] = float(best["area_ratio"])
+    empty["edge_drop_frac"] = float(best["drop_frac"])
+    empty["rect_fill"] = float(best["fill"])
+    empty["solidity"] = float(best["solidity"])
+    empty["rect_angle_deg"] = float(rect_angle)
+    empty["center_source"] = best["source"]
+    empty["candidate_score"] = float(best["score"])
+
+    if mm_per_px is not None:
+        empty["rect_w_mm"] = float(rect_w * mm_per_px)
+        empty["rect_h_mm"] = float(rect_h * mm_per_px)
+
+    empty["mask"] = best["region"]
+
+    # ----- sanity gates: an implausible footprint is reported as absent ----
+    if best["drop_frac"] < cfg.product_inside_min_edge_drop_frac:
+        empty["reason"] = "no_rigid_edges"
+        return empty
+
+    if (
+        best["solidity"] < cfg.product_inside_min_solidity
+        or best["fill"] < cfg.product_inside_min_rect_fill
+    ):
+        empty["reason"] = "footprint_not_compact"
+        return empty
+
+    if best["area_ratio"] < cfg.product_inside_min_area_ratio_of_package:
+        empty["reason"] = "too_small"
+        return empty
+
+    if best["area_ratio"] > cfg.product_inside_max_area_ratio_of_package:
+        empty["reason"] = "too_large"
+        return empty
+
+    center_roi = (int(round(rect_cx)), int(round(rect_cy)))
+    center_full = (
+        int(round(cfg.roi_x1 + rect_cx)),
+        int(round(cfg.roi_y1 + rect_cy)),
+    )
+
+    # Depth comes from the contact patch: that is film resting ON the product,
+    # so its median is the product's top and not the drape around it.
+    core = best["patch"]
+    supported = (
+        (core == 1)
         & (depth_roi > cfg.min_valid_depth_mm)
         & (depth_roi < cfg.max_valid_depth_mm)
-    ].astype(np.float32)
+    )
+    product_values = depth_roi[supported].astype(np.float32)
 
     if product_values.size >= cfg.min_surface_depth_count:
-        raw_product_depth = float(np.median(product_values))
-        product_depth_mm = raw_product_depth + cfg.measurement_depth_offset_mm
+        product_depth_mm = float(np.median(product_values)) + cfg.measurement_depth_offset_mm
     else:
         product_depth_mm = center_full_depth_mm
 
@@ -2605,25 +2879,20 @@ def detect_product_inside_polymailer(cfg, depth_roi, package_mask, center_full_d
         intrinsics,
     )
 
-    return {
-        "found": True,
-        "center_roi": (int(round(cx_roi)), int(round(cy_roi))),
-        "center_full": center_full,
-        "center_x_mm": center_x_mm,
-        "center_y_mm": center_y_mm,
-        "depth_mm": product_depth_mm,
-        "area_px": product_area,
-        "peak_mm": dome_mm,
-        "noise_mm": noise_mm,
-        "peak_noise_multiple": dome_mm / noise_mm,
-        "threshold_mm": threshold_mm,
-        "area_ratio_of_package": float(area_ratio),
-        "mask": product_candidate,
-        "core_mask": core,
-        "core_area_px": core_area,
-        "core_found": bool(core_ok),
-        "reason": "ok",
-    }
+    empty.update(
+        found=True,
+        reason="ok",
+        center_roi=center_roi,
+        center_full=center_full,
+        center_x_mm=center_x_mm,
+        center_y_mm=center_y_mm,
+        depth_mm=product_depth_mm,
+        core_mask=core,
+        core_area_px=int(core.sum()),
+        core_found=True,
+    )
+
+    return empty
 
 
 def run_sam_package_depth_type(

@@ -322,12 +322,27 @@ def make_json_result(cfg, result, timestamp):
             "dome_mm": json_number(product_inside.get("peak_mm")),
             "noise_mm": json_number(product_inside.get("noise_mm")),
             "dome_noise_multiple": json_number(product_inside.get("peak_noise_multiple")),
+            # Elevation above which seeds were allowed to start.
             "threshold_mm": json_number(product_inside.get("threshold_mm")),
-            # The crown the reported centre is taken from. core_found False
-            # means the dome had no usable top and the centre fell back to the
-            # whole footprint.
+            # The contact patch (film resting on the product's top) the plane
+            # and the reported depth are taken from.
             "core_found": bool(product_inside.get("core_found", False)),
             "core_area_px": int(product_inside.get("core_area_px", 0)),
+            # Rotated-rectangle fit of the footprint, in millimetres at the
+            # package's depth, and the shape/edge scores the sanity gates test.
+            # edge_drop_frac: fraction of the surrounding ring that falls well
+            # below the product plane -- low means no rigid edges were seen.
+            "rect_w_mm": json_number(product_inside.get("rect_w_mm")),
+            "rect_h_mm": json_number(product_inside.get("rect_h_mm")),
+            "rect_angle_deg": json_number(product_inside.get("rect_angle_deg")),
+            "edge_drop_frac": json_number(product_inside.get("edge_drop_frac")),
+            "rect_fill": json_number(product_inside.get("rect_fill")),
+            "solidity": json_number(product_inside.get("solidity")),
+            # Which candidate won: "flat" (film resting on the product's top)
+            # or "peak" (top of the dome, used when the drape forms a level
+            # crest the flat path would ride).
+            "center_source": product_inside.get("center_source"),
+            "candidate_score": json_number(product_inside.get("candidate_score")),
         },
         "size_scale": json_number(cfg.package_size_scale),
         "base_depth_mm": json_number(cfg.base_depth_mm),
