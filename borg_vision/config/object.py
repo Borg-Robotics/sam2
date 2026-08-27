@@ -74,7 +74,19 @@ class ObjectConfig(BaseConfig):
     min_rectangularity: float = 0.18
     max_aspect_ratio: float = 7.0
 
-    reject_masks_touching_roi_border: bool = True
+    # OFF as of 2026-08-27. Objects legitimately land at the ROI edge -- a
+    # product discharged near the table's far edge sat 6 px inside the old ROI
+    # top, and this gate dropped its mask before any other check ran, failing
+    # the detection with "No valid mask found" (capture 13-38-03_rejected).
+    #
+    # What it was filtering still gets filtered, just by score rather than by a
+    # hard reject: on that capture the only other border-touching candidate was
+    # a background blob at rectangularity 0.298 against the product's 0.694, and
+    # it also sat further from target_area_ratio. Note it DOES still pass the
+    # area and rectangularity gates, so it is now a competing candidate rather
+    # than an excluded one -- if a background mask ever outscores a real object,
+    # this is the first thing to turn back on.
+    reject_masks_touching_roi_border: bool = False
     roi_border_margin_px: int = 12
 
     use_mask_cleanup: bool = True
