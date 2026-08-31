@@ -199,10 +199,21 @@ def candidate_height_above_base_mm(cfg, depth_roi, mask):
     The ring is the reference surface the candidate rests on, taken from the
     same frame, so a flat plate feature measures ~0 whatever the plate's
     absolute depth. Returns None when either side lacks valid depth -- the
-    caller must treat that as unknown, not as flat."""
+    caller must treat that as unknown, not as flat.
+
+    The valid-FRACTION check matters as much as the count: a glossy top face
+    can blank the stereo out over the whole object, leaving only misaligned
+    plate pixels valid inside the RGB mask -- enough pixels to pass a bare
+    count, all reading base depth, measuring a 115 mm white box as 0 mm tall
+    (camera_2 2026-08-31_11-24-51_rejected). If the gate cannot see most of
+    the candidate's own surface it has no opinion."""
     valid = (depth_roi > cfg.min_valid_depth_mm) & (depth_roi < cfg.max_valid_depth_mm)
+    mask_area = int((mask == 1).sum())
     inside = (mask == 1) & valid
-    if int(inside.sum()) < cfg.height_gate_min_depth_count:
+    inside_count = int(inside.sum())
+    if inside_count < cfg.height_gate_min_depth_count:
+        return None
+    if inside_count < cfg.height_gate_min_valid_frac * max(mask_area, 1):
         return None
 
     k = 2 * cfg.height_gate_ring_px + 1

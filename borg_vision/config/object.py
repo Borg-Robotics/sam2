@@ -112,6 +112,12 @@ class ObjectConfig(BaseConfig):
     min_height_above_base_mm: float = 10.0
     height_gate_ring_px: int = 15
     height_gate_min_depth_count: int = 50
+    # The gate may only REJECT when it can see at least this fraction of the
+    # candidate's own surface in valid depth; below it, the gate abstains. A
+    # glossy top face can blank the stereo out across the whole object while
+    # misaligned plate pixels stay valid inside the RGB mask, reading base
+    # depth -- without this floor that measured a 115 mm white box as 0 mm.
+    height_gate_min_valid_frac: float = 0.5
 
     # Scoring weights.
     center_score_weight: float = 1.4
