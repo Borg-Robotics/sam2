@@ -101,6 +101,18 @@ class ObjectConfig(BaseConfig):
     # mask but rejects it once it balloons.
     max_cleaned_area_growth: float = 1.2
 
+    # Candidate height gate. The scoring below is purely 2D, so a flat feature
+    # OF the plate can out-score a real object -- the moulded centre recess is
+    # a perfect square at dead centre, and on camera_2 2026-08-31_10-25-52 it
+    # beat an off-centre box (and shipped with height_mm=2). A candidate must
+    # rise above the surface ring just outside its own mask, measured from the
+    # same depth frame, so there is no fixed plate depth to calibrate and the
+    # gate follows plate height or camera changes on its own. The gate is
+    # skipped for a candidate when either side lacks valid depth.
+    min_height_above_base_mm: float = 10.0
+    height_gate_ring_px: int = 15
+    height_gate_min_depth_count: int = 50
+
     # Scoring weights.
     center_score_weight: float = 1.4
     area_score_weight: float = 1.2

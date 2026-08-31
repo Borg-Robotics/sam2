@@ -193,7 +193,30 @@ def center_depth_mm(cfg, depth_roi, mask, center_roi):
     return float(np.median(values)), int(values.size)
 
 
-def choose_best_object_mask(cfg, masks, roi_rgb):
+def candidate_height_above_base_mm(cfg, depth_roi, mask):
+    """Median rise of a mask above the surface ring just outside it.
+
+    The ring is the reference surface the candidate rests on, taken from the
+    same frame, so a flat plate feature measures ~0 whatever the plate's
+    absolute depth. Returns None when either side lacks valid depth -- the
+    caller must treat that as unknown, not as flat."""
+    valid = (depth_roi > cfg.min_valid_depth_mm) & (depth_roi < cfg.max_valid_depth_mm)
+    inside = (mask == 1) & valid
+    if int(inside.sum()) < cfg.height_gate_min_depth_count:
+        return None
+
+    k = 2 * cfg.height_gate_ring_px + 1
+    dilated = cv2.dilate(mask, np.ones((k, k), np.uint8))
+    ring = (dilated > 0) & (mask == 0) & valid
+    if int(ring.sum()) < cfg.height_gate_min_depth_count:
+        return None
+
+    base_mm = float(np.median(depth_roi[ring].astype(np.float32)))
+    top_mm = float(np.median(depth_roi[inside].astype(np.float32)))
+    return base_mm - top_mm
+
+
+def choose_best_object_mask(cfg, masks, roi_rgb, depth_roi=None):
     h, w = roi_rgb.shape[:2]
     roi_area = h * w
     roi_cx = w / 2
@@ -237,6 +260,17 @@ def choose_best_object_mask(cfg, masks, roi_rgb):
         if aspect_ratio > cfg.max_aspect_ratio:
             continue
 
+        height_mm = None
+        if depth_roi is not None:
+            height_mm = candidate_height_above_base_mm(cfg, depth_roi, mask)
+            if height_mm is not None and height_mm < cfg.min_height_above_base_mm:
+                if cfg.debug_print_masks:
+                    print(
+                        f"mask={i:03d} rejected: {height_mm:.1f} mm above base "
+                        f"(< {cfg.min_height_above_base_mm:.0f})"
+                    )
+                continue
+
         center = get_mask_center(mask)
 
         if center is None:
@@ -274,6 +308,7 @@ def choose_best_object_mask(cfg, masks, roi_rgb):
                 f"center={center_score:.2f} "
                 f"sam_iou={sam_iou:.2f} "
                 f"stable={sam_stability:.2f} "
+                f"height={'?' if height_mm is None else f'{height_mm:.1f}'} "
                 f"bbox=({x},{y},{bw},{bh})"
             )
 
@@ -290,6 +325,7 @@ def choose_best_object_mask(cfg, masks, roi_rgb):
             "area_score": float(area_score),
             "sam_iou": sam_iou,
             "sam_stability": sam_stability,
+            "height_above_base_mm": height_mm,
         }
 
         if best is None or candidate["score"] > best["score"]:
@@ -448,7 +484,7 @@ def run_sam2_object_segmentation(
     with torch.inference_mode():
         masks = mask_generator.generate(roi_rgb)
 
-    obj = choose_best_object_mask(cfg, masks, roi_rgb)
+    obj = choose_best_object_mask(cfg, masks, roi_rgb, depth_roi=depth_roi)
 
     if obj is None:
         return None
