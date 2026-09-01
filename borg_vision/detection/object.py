@@ -452,9 +452,10 @@ def score_object_grasp_candidates(
     cands.sort(key=lambda c: -c["score"])
 
     # Non-max suppression, so the list is genuinely alternative spots rather than
-    # a cluster of neighbouring pixels that would all fail the same way.
+    # a cluster of neighbouring pixels that would all fail the same way. The
+    # separation is configurable per mode (in cup radii).
     kept = []
-    min_sep = radius_px * 2
+    min_sep = radius_px * cfg.obj_grasp_min_sep_radii
     for c in cands:
         if all((c["x_roi"] - k["x_roi"]) ** 2 + (c["y_roi"] - k["y_roi"]) ** 2
                > min_sep * min_sep for k in kept):

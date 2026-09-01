@@ -147,6 +147,11 @@ class ObjectConfig(BaseConfig):
     # The pick plus three retries: the scorer returns one ranked list with the
     # pick at its head, so this is 1 + 3 and consumers are handed the tail.
     obj_grasp_max_candidates: int = 4
+    # Spacing between kept candidates, in cup radii. 2.0 = a full cup
+    # diameter apart: genuinely independent spots that cannot fail the same
+    # way. (Package mode overrides this to 1.0 -- product fallbacks are
+    # purely score-ranked at the operator's request.)
+    obj_grasp_min_sep_radii: float = 2.0
 
     # Scoring weights. Centre-biased by design: w_centre dominates so the pick
     # stays at the centroid unless the surface there is measurably worse than a
