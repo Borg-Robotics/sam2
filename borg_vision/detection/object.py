@@ -193,6 +193,30 @@ def center_depth_mm(cfg, depth_roi, mask, center_roi):
     return float(np.median(values)), int(values.size)
 
 
+def top_face_depth_and_mask(cfg, depth_roi, mask):
+    """Depth of the object's TOP face plus the submask of top-face pixels.
+
+    The nearest coherent depth cluster inside the mask is the top face; the
+    median of the WHOLE mask is not, because a standing object's mask includes
+    its front face running down to the plate (see object_top_face_* in the
+    config). Returns (depth_mm, count, top_mask) or (None, 0, None) when there
+    is not enough valid depth to say."""
+    valid = (depth_roi > cfg.min_valid_depth_mm) & (depth_roi < cfg.max_valid_depth_mm)
+    inside = (mask == 1) & valid
+    vals = depth_roi[inside].astype(np.float32)
+    if vals.size < cfg.object_top_face_min_px:
+        return None, 0, None
+
+    near = float(np.percentile(vals, cfg.object_top_face_percentile))
+    cutoff = near + cfg.object_top_face_band_mm
+    cluster = vals[vals <= cutoff]
+    if cluster.size < cfg.object_top_face_min_px:
+        return None, 0, None
+
+    top_mask = (inside & (depth_roi <= cutoff)).astype(np.uint8)
+    return float(np.median(cluster)), int(cluster.size), top_mask
+
+
 def candidate_height_above_base_mm(cfg, depth_roi, mask):
     """Median rise of a mask above the surface ring just outside it.
 
@@ -223,7 +247,13 @@ def candidate_height_above_base_mm(cfg, depth_roi, mask):
         return None
 
     base_mm = float(np.median(depth_roi[ring].astype(np.float32)))
-    top_mm = float(np.median(depth_roi[inside].astype(np.float32)))
+    # Height of the TOP face, not the mask's overall median: a standing
+    # object's mask is dominated by its front face at near-plate depth, and
+    # the plain median would measure it as flat and reject it.
+    vals = depth_roi[inside].astype(np.float32)
+    near = float(np.percentile(vals, cfg.object_top_face_percentile))
+    cluster = vals[vals <= near + cfg.object_top_face_band_mm]
+    top_mm = float(np.median(cluster)) if cluster.size else float(np.median(vals))
     return base_mm - top_mm
 
 
@@ -506,12 +536,21 @@ def run_sam2_object_segmentation(
         cfg.roi_y1 + obj["center_roi"][1],
     )
 
-    distance_mm, depth_count = center_depth_mm(
-        cfg,
-        depth_roi,
-        obj["mask"],
-        obj["center_roi"],
+    # TOP-FACE depth over the whole mask -- a standing object's mask includes
+    # its front face down to the plate, and any centre/median sampling then
+    # reports plate depth and sends the cup through the object. Falls back to
+    # the old centre-patch median only when depth is too sparse to cluster.
+    distance_mm, depth_count, top_mask = top_face_depth_and_mask(
+        cfg, depth_roi, obj["mask"]
     )
+    if distance_mm is None:
+        top_mask = None
+        distance_mm, depth_count = center_depth_mm(
+            cfg,
+            depth_roi,
+            obj["mask"],
+            obj["center_roi"],
+        )
 
     dimensions = estimate_object_dimensions_mm(
         cfg,
@@ -527,14 +566,30 @@ def run_sam2_object_segmentation(
         intrinsics,
     )
 
+    # The cup belongs on the TOP face. When the top-face pixels form a usable
+    # region, both the grasp anchor and the scorer's playing field shrink to
+    # it -- on a standing box the whole-mask centroid sits on the front face.
+    grasp_mask = obj["mask"]
+    grasp_anchor = obj["center_roi"]
+    if top_mask is not None:
+        top_region = cv2.morphologyEx(
+            top_mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8)
+        )
+        top_region = largest_component(top_region)
+        if top_region is not None and int(top_region.sum()) >= cfg.object_top_face_min_px:
+            top_center = get_mask_center(top_region)
+            if top_center is not None:
+                grasp_mask = top_region
+                grasp_anchor = top_center
+
     # Suction-cup grasp. Best-first; empty when the object is too small for the
     # cup or depth was too sparse to fit a plane, in which case the grasp point
-    # falls back to the object's centroid -- a small object is still pickable,
-    # the scorer just cannot vouch for the surface it lands on.
+    # falls back to the anchor -- a small object is still pickable, the scorer
+    # just cannot vouch for the surface it lands on.
     grasp_candidates = score_object_grasp_candidates(
         cfg,
-        obj,
-        obj["center_roi"],
+        {"mask": grasp_mask},
+        grasp_anchor,
         depth_roi,
         distance_mm,
         dimensions,
@@ -544,7 +599,14 @@ def run_sam2_object_segmentation(
     if best is not None:
         grasp_x_mm, grasp_y_mm, grasp_z_mm = best["x_mm"], best["y_mm"], best["z_mm"]
     else:
-        grasp_x_mm, grasp_y_mm, grasp_z_mm = center_x_mm, center_y_mm, distance_mm
+        anchor_full = (
+            cfg.roi_x1 + grasp_anchor[0],
+            cfg.roi_y1 + grasp_anchor[1],
+        )
+        grasp_x_mm, grasp_y_mm = pixel_to_camera_xy_mm(
+            anchor_full, distance_mm, intrinsics
+        )
+        grasp_z_mm = distance_mm
 
     return {
         "roi_rgb": roi_rgb,

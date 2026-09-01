@@ -24,11 +24,11 @@ class ObjectDetector(BaseDetector):
     requires_barcode = False
 
     def detect(self, frames, barcode=None):
-        """Run SAM2 object segmentation + center depth on the given frames.
+        """Run SAM2 object segmentation + top-face depth on the given frames.
 
-        Returns ObjectResult or None when no valid object mask was found. The
-        center depth is measured from the classification depth (object mode has
-        no separate measurement stereo).
+        Returns ObjectResult or None when no valid object mask was found.
+        Depth is measured from the stream chosen by
+        cfg.object_use_measurement_depth (see _measure_depth).
         """
         if self._mask_generator is None:
             raise RuntimeError("Model not loaded; call load_model() first")
@@ -44,7 +44,7 @@ class ObjectDetector(BaseDetector):
         raw = run_sam2_object_segmentation(
             self.cfg,
             frames.rgb,
-            frames.depth_class_aligned,
+            self._measure_depth(frames),
             self._mask_generator,
             self.camera.intrinsics,
         )
@@ -61,13 +61,24 @@ class ObjectDetector(BaseDetector):
 
         return ObjectResult.from_raw(raw, frames)
 
+    def _measure_depth(self, frames):
+        """The depth stream all measuring runs on (segmentation is RGB-only).
+
+        The measurement stereo sees small and glossy objects the
+        classification stream is near-blind to; on a camera without a
+        dedicated measurement stream the two are the same array. Debug
+        artifacts save this same stream so replays see what detection saw."""
+        if self.cfg.object_use_measurement_depth:
+            return frames.depth_measure_aligned
+        return frames.depth_class_aligned
+
     # ---------------------------------------------------------- visualization
 
     def _draw_result(self, result):
         return draw_result(
             self.cfg,
             result.frames.rgb,
-            result.frames.depth_class_aligned,
+            self._measure_depth(result.frames),
             result.raw,
         )
 
@@ -107,7 +118,7 @@ class ObjectDetector(BaseDetector):
         json_path = save_dir / artifact_name("object_segment_depth", "json", timestamp, organized)
 
         cv2.imwrite(str(raw_path), result.frames.rgb)
-        np.save(str(depth_aligned_path), result.frames.depth_class_aligned)
+        np.save(str(depth_aligned_path), self._measure_depth(result.frames))
         cv2.imwrite(str(result_path), result_bgr)
         save_binary_mask(mask_path, result.raw["object"]["mask"])
 

@@ -66,6 +66,25 @@ class ObjectConfig(BaseConfig):
     center_depth_radius_px: int = 35
     min_center_depth_count: int = 30
 
+    # Measure from the MEASUREMENT stereo stream instead of the classification
+    # stream. The class stream is near-blind on small or glossy objects (11-14%
+    # valid over the 2026-09-01 boxes) and its fallback then reads the plate;
+    # the measurement stream saw the same objects fine. Segmentation is
+    # unaffected (RGB). On a camera without a dedicated measurement stream the
+    # two are the same array, so this is safe everywhere.
+    object_use_measurement_depth: bool = True
+
+    # Top-face depth: measure the nearest coherent depth cluster inside the
+    # mask instead of the median of everything. A standing box's mask includes
+    # its FRONT face, which runs down to the plate and outnumbers the top-face
+    # pixels -- the plain median then reports plate depth (13-41-11: median
+    # 703 mm vs true top 635 mm) and the cup is sent through the box. The top
+    # face is by definition the nearest surface: cluster = everything within
+    # top_face_band_mm of the top_face_percentile'th nearest pixel.
+    object_top_face_percentile: float = 5.0
+    object_top_face_band_mm: float = 15.0
+    object_top_face_min_px: int = 40
+
     # Object mask gating & scoring.
     min_area_ratio: float = 0.008
     max_area_ratio: float = 0.35
