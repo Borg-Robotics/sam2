@@ -55,6 +55,10 @@ class PackageResult(BaseResult):
     # product_inside_center and is not repeated here. Empty when no product
     # was found or nothing scoreable sat even half a cup from the centre.
     product_inside_grasp_candidates: list = field(default_factory=list)
+    # Same, for BOXES: fallbacks around the package top-face centre (the box
+    # pick point), avoiding tape seams and dents the centre may sit on. Empty
+    # for polymailers.
+    grasp_candidates: list = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw, frames):
@@ -122,6 +126,10 @@ class BoxResult(BaseResult):
     angle_deg: Optional[float] = None
     center_x_mm: Optional[float] = None
     center_y_mm: Optional[float] = None
+    # Ranked fallback grasp points around the centre (dicts with
+    # x_mm/y_mm/z_mm/score), best first. RETRIES ONLY -- the centre itself is
+    # the primary and is not repeated here.
+    grasp_candidates: list = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw, frames):

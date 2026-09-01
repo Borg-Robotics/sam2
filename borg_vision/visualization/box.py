@@ -77,6 +77,22 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
     cv2.circle(depth_vis, (cx, cy), 8, (0, 255, 255), -1)
     cv2.circle(depth_vis, (cx, cy), 16, (0, 255, 255), 2)
 
+    # Fallback grasp points, numbered in rank order (open circles; the filled
+    # primary stays distinct).
+    for rank, cand in enumerate(
+        result["final_output"].get("grasp_candidates") or [], start=1
+    ):
+        pf = cand.get("point_full")
+        if pf is None:
+            continue
+        fx_, fy_ = int(pf[0]), int(pf[1])
+        for img, color in ((result_rgb, (255, 160, 0)), (depth_vis, (0, 160, 255))):
+            cv2.circle(img, (fx_, fy_), 16, color, 2)
+            cv2.putText(
+                img, str(rank), (fx_ + 20, fy_ + 7),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
+            )
+
     lines = [
         "BOX MEASUREMENTS",
         f"box_face_depth_mm={fmt3(result['box_face_depth_mm'])}",
@@ -117,4 +133,19 @@ def make_json_result(cfg, result, timestamp):
         "angle_deg": json_number(dimensions["angle_deg"]),
         "center_x_mm": json_number(result["center_x_mm"]),
         "center_y_mm": json_number(result["center_y_mm"]),
+        # Ranked fallback grasp points around the centre (retries only).
+        "grasp_candidates": [
+            {
+                "x_mm": json_number(c.get("x_mm")),
+                "y_mm": json_number(c.get("y_mm")),
+                "z_mm": json_number(c.get("z_mm")),
+                "score": json_number(c.get("score")),
+                "point_full": (
+                    [int(c["point_full"][0]), int(c["point_full"][1])]
+                    if c.get("point_full") is not None
+                    else None
+                ),
+            }
+            for c in (result["final_output"].get("grasp_candidates") or [])
+        ],
     }

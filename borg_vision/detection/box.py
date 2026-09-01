@@ -1217,6 +1217,37 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
         intrinsics,
     )
 
+    # Fallback grasp points around the centre -- RETRIES ONLY, the primary
+    # stays the centre. Best-scoring other cup spots on the top face, at
+    # least box_grasp_min_offset_mm from the centre.
+    grasp_candidates = []
+    if box.get("center_roi") is not None and box_face_depth is not None:
+        from .object import score_object_grasp_candidates
+
+        scored = score_object_grasp_candidates(
+            cfg,
+            {"mask": box["mask"]},
+            box["center_roi"],
+            depth_roi_scaled,
+            box_face_depth,
+            None,
+            intrinsics,
+        )
+        for c in scored:
+            if c.get("offset_mm", 0.0) < cfg.box_grasp_min_offset_mm:
+                continue
+            grasp_candidates.append(
+                {
+                    "x_mm": c.get("x_mm"),
+                    "y_mm": c.get("y_mm"),
+                    "z_mm": c.get("z_mm"),
+                    "score": c.get("score"),
+                    "point_full": c.get("point_full"),
+                }
+            )
+            if len(grasp_candidates) >= cfg.box_grasp_retry_count:
+                break
+
     return {
         "roi_rgb": roi_rgb,
         # Raw measurement-stereo depth over the ROI, saved to the debug dir as a
@@ -1240,5 +1271,6 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
             "angle_deg": dimensions["angle_deg"],
             "center_x_mm": center_x_mm,
             "center_y_mm": center_y_mm,
+            "grasp_candidates": grasp_candidates,
         },
     }

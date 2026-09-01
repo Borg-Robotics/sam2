@@ -300,6 +300,30 @@ class BoxConfig(BaseConfig):
     secondary_face_max_aspect_ratio: float = 10.0
     secondary_face_min_center_score: float = 0.12
 
+    # ----- suction-cup fallback grasp points around the box centre --------
+    # Up to 2 ranked alternatives for when the cup fails to seal on the
+    # centre (tape seam, dent). Scored by the object-mode grasp scorer,
+    # which reads these obj_grasp_* and center-depth fields off whatever
+    # config it is handed -- names MUST match ObjectConfig's. Runs on the
+    # sparse measurement stream, hence the low valid-fraction floor.
+    obj_grasp_cup_diameter_mm: float = 30.0
+    obj_grasp_edge_margin_mm: float = 5.0
+    obj_grasp_max_offset_mm: float = 55.0
+    obj_grasp_grid_step_px: int = 6
+    obj_grasp_min_valid_px: int = 30
+    obj_grasp_min_valid_frac: float = 0.10
+    obj_grasp_min_depth_levels: int = 3
+    obj_grasp_max_candidates: int = 6
+    obj_grasp_min_sep_radii: float = 1.0
+    obj_grasp_w_rough: float = 0.35
+    obj_grasp_w_tilt: float = 0.15
+    obj_grasp_w_centre: float = 0.45
+    obj_grasp_w_edge: float = 0.05
+    center_depth_radius_px: int = 35
+    min_center_depth_count: int = 30
+    box_grasp_retry_count: int = 2
+    box_grasp_min_offset_mm: float = 15.0
+
     # Set True to print every scored candidate (score, area, rect, colour, bbox)
     # during a detection. That output is what found the 2026-08-28 merge bug --
     # it showed the correct full-face mask scoring highest yet losing to a merged
