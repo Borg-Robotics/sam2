@@ -3128,6 +3128,43 @@ def run_sam_package_depth_type(
             if len(product_inside_grasp_candidates) >= cfg.product_inside_grasp_retry_count:
                 break
 
+    # Same fallback treatment for BOXES, whose pick lands on the package
+    # top-face centre: tape seams and dents break the seal there, so rank the
+    # smoothest/flattest other cup spots on the top face. Shares the cup
+    # geometry, offset floor and retry count with the product-inside path --
+    # it is the same cup on the same station.
+    grasp_candidates = []
+    if classification["package_type"] == "box" and best["center_roi"] is not None:
+        from .object import score_object_grasp_candidates
+
+        # MEASUREMENT depth, not classification: on camera_1 the class stream
+        # is ~99% blind over cardboard box tops (fine on mailer film), while
+        # the measurement stream reads them at the correct depth -- it is
+        # already what package_face_depth_mm measures the box from.
+        scored = score_object_grasp_candidates(
+            cfg,
+            {"mask": best["mask"]},
+            best["center_roi"],
+            depth_measure_roi,
+            top_face_depth_mm,
+            None,
+            intrinsics,
+        )
+        for c in scored:
+            if c.get("offset_mm", 0.0) < cfg.product_inside_grasp_min_offset_mm:
+                continue
+            grasp_candidates.append(
+                {
+                    "x_mm": c.get("x_mm"),
+                    "y_mm": c.get("y_mm"),
+                    "z_mm": c.get("z_mm"),
+                    "score": c.get("score"),
+                    "point_full": c.get("point_full"),
+                }
+            )
+            if len(grasp_candidates) >= cfg.product_inside_grasp_retry_count:
+                break
+
     heatmap = make_package_depth_heatmap(
         cfg,
         depth_roi=depth_class_roi,
@@ -3164,6 +3201,7 @@ def run_sam_package_depth_type(
         ),
         "product_inside_depth_mm": product_inside["depth_mm"],
         "product_inside_grasp_candidates": product_inside_grasp_candidates,
+        "grasp_candidates": grasp_candidates,
     }
 
     print()

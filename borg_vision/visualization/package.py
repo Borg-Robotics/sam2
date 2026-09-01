@@ -186,21 +186,23 @@ def draw_result(cfg, frame_bgr, depth_class_aligned, result):
         cv2.circle(depth_vis, (pcx, pcy), 8, (0, 255, 255), -1)
         cv2.circle(depth_vis, (pcx, pcy), 18, (0, 255, 255), 3)
 
-        # Fallback grasp points, numbered in rank order. Open circles so the
-        # filled primary stays visually distinct.
-        for rank, cand in enumerate(
-            final_output.get("product_inside_grasp_candidates") or [], start=1
-        ):
-            pf = cand.get("point_full")
-            if pf is None:
-                continue
-            fx_, fy_ = int(pf[0]), int(pf[1])
-            for img, color in ((result_rgb, (255, 160, 0)), (depth_vis, (0, 160, 255))):
-                cv2.circle(img, (fx_, fy_), 18, color, 3)
-                cv2.putText(
-                    img, str(rank), (fx_ + 22, fy_ + 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
-                )
+    # Fallback grasp points, numbered in rank order -- the product-inside
+    # ones for a polymailer, the top-face-centre ones for a box (at most one
+    # list is non-empty). Open circles so the filled primary stays distinct.
+    for rank, cand in enumerate(
+        (final_output.get("product_inside_grasp_candidates") or [])
+        + (final_output.get("grasp_candidates") or []), start=1
+    ):
+        pf = cand.get("point_full")
+        if pf is None:
+            continue
+        fx_, fy_ = int(pf[0]), int(pf[1])
+        for img, color in ((result_rgb, (255, 160, 0)), (depth_vis, (0, 160, 255))):
+            cv2.circle(img, (fx_, fy_), 18, color, 3)
+            cv2.putText(
+                img, str(rank), (fx_ + 22, fy_ + 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
+            )
 
     result_bgr_for_barcode = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
 
@@ -343,6 +345,22 @@ def make_json_result(cfg, result, timestamp):
                 ),
             }
             for c in (final_output.get("product_inside_grasp_candidates") or [])
+        ],
+        # Box-pick fallbacks around the package top-face centre (empty for
+        # polymailers), same shape as the product-inside list above.
+        "grasp_candidates": [
+            {
+                "x_mm": json_number(c.get("x_mm")),
+                "y_mm": json_number(c.get("y_mm")),
+                "z_mm": json_number(c.get("z_mm")),
+                "score": json_number(c.get("score")),
+                "point_full": (
+                    [int(c["point_full"][0]), int(c["point_full"][1])]
+                    if c.get("point_full") is not None
+                    else None
+                ),
+            }
+            for c in (final_output.get("grasp_candidates") or [])
         ],
         "product_inside_debug": {
             "reason": product_inside["reason"],

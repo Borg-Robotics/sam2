@@ -356,7 +356,13 @@ class PackageConfig(BaseConfig):
     obj_grasp_max_offset_mm: float = 55.0
     obj_grasp_grid_step_px: int = 6
     obj_grasp_min_valid_px: int = 30
-    obj_grasp_min_valid_frac: float = 0.60
+    # Lower than object mode's 0.60: the box fallbacks score on the sparse
+    # measurement stream (~15% coverage over a cardboard top on camera_1),
+    # and a cup-sized disc still holds hundreds of valid points at that
+    # density -- plenty for the plane fit. Mailer film is ~97% covered in
+    # the stream the product-inside fallbacks use, so this floor is inert
+    # there.
+    obj_grasp_min_valid_frac: float = 0.10
     obj_grasp_min_depth_levels: int = 3
     # More than the wire needs: the centre-separation filter thins this list
     # down to product_inside_grasp_retry_count afterwards.
