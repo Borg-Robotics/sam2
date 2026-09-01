@@ -70,13 +70,26 @@ class PolymailerConfig(BaseConfig):
     center_depth_radius_px: int = 35
     min_center_depth_count: int = 30
 
+    # Force the cut onto one end instead of letting clearance decide.
+    # "" = automatic (cut whichever end has more empty mailer between the
+    # product and the edge); "TOP" or "BOTTOM" = always cut that end, in the
+    # image-row convention (TOP = smaller rows; side_names in
+    # vision_cameras.yaml maps these onto planner side indices). The grasp
+    # end stays derived as the opposite, so forcing TOP also forces the cup
+    # to the bottom end. The clearance gaps are still measured and reported
+    # (top/bottom_gap_mm) -- with a forced side the cut row lands in the
+    # forced end's gap however small it is, so watch those numbers if a
+    # product ever rides high in the mailer.
+    force_cut_side: str = ""
+
     # Suction-cup grasp candidate search. The single release-grasp point is a
     # fixed geometric midpoint with no notion of surface quality; these rank
     # nearby alternatives so a failed grasp has somewhere sensible to retry.
     # MEASURE the cup diameter -- the default is a placeholder and it sets both
     # the scoring disc and the edge clearance constraint.
-    # Which end to grasp is NOT configured: it is derived as the opposite of
-    # cut_side, so the cup can never end up on the end the product slides out of.
+    # Which end to grasp is NOT configured directly: it is derived as the
+    # opposite of cut_side (see force_cut_side above), so the cup can never
+    # end up on the end the product slides out of.
 
     # How far in from the end edge midpoint to aim, for bottom/top regions. The
     # search anchors here instead of at the geometric midpoint: grabbing nearer the

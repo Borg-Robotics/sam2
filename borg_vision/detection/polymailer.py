@@ -424,7 +424,8 @@ def choose_cut_side(cfg, poly_mask, product, intrinsics, depth_mm):
 
     Compares the empty space between the product and the TOP edge of the
     polymailer vs the product and the BOTTOM edge, and recommends cutting on
-    whichever side has the most clearance from the product.
+    whichever side has the most clearance from the product -- unless
+    cfg.force_cut_side pins it to one end ("TOP"/"BOTTOM"; "" = automatic).
     """
     result = {
         "cut_side": None,
@@ -454,7 +455,11 @@ def choose_cut_side(cfg, poly_mask, product, intrinsics, depth_mm):
     top_gap_px = max(prod_top - poly_top, 0)
     bottom_gap_px = max(poly_bottom - prod_bottom, 0)
 
-    if top_gap_px >= bottom_gap_px:
+    # force_cut_side overrides the clearance comparison entirely; the gaps are
+    # still measured and reported either way. Grasp side follows as the
+    # opposite end downstream, so forcing TOP also pins the cup to the bottom.
+    forced = (getattr(cfg, "force_cut_side", "") or "").strip().upper()
+    if forced == "TOP" or (forced != "BOTTOM" and top_gap_px >= bottom_gap_px):
         cut_side = "TOP"
         cut_row_roi = (poly_top + prod_top) // 2
     else:
