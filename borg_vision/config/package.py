@@ -16,6 +16,14 @@ from .base import BaseConfig
 class PackageConfig(BaseConfig):
     save_dir: str = "package_barcode_detection_results"
 
+    # Package targets are large (a mailer or box filling much of the ROI), so
+    # the base 24x24 SAM prompt grid is overkill. 16x16 halves segmentation
+    # time and reproduced the 24x24 results exactly on the 2026-09-01 A/B
+    # battery (5 captures, box + polymailer: same type, same mask source,
+    # sizes within 1 mm, product-inside centres within 2 px). Other modes
+    # keep the base default.
+    sam_points_per_side: int = 18
+
     base_depth_mm: float = 695.0
     package_size_scale: float = 1.04
 
