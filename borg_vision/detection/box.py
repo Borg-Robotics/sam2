@@ -138,6 +138,169 @@ def box_face_depth_mm(cfg, depth_roi, mask):
     }
 
 
+def _face_band(profile, min_fraction):
+    """Longest run of consecutive True in `profile >= min_fraction`, as (lo, hi).
+
+    NaN entries (too few depth readings to judge that line) do not break a run --
+    a dropout band inside the box face must not split it in two.
+    """
+    ok = np.array([
+        (False if np.isnan(v) else bool(v >= min_fraction)) for v in profile
+    ])
+    unknown = np.isnan(profile)
+    best = cur = None
+
+    for i in range(len(ok)):
+        if ok[i]:
+            cur = i if cur is None else cur
+            if best is None or (i - cur) > (best[1] - best[0]):
+                best = (cur, i)
+        elif not unknown[i]:
+            cur = None
+
+    return best
+
+
+def refine_box_mask_to_face_extent(cfg, mask, depth_roi, face_depth_mm):
+    """Replace `mask` with the full extent of the box face it sits on.
+
+    SAM2 segments on APPEARANCE, so a box top printed or taped into bands is
+    seen as several regions and the mask covers only some of them -- capture
+    2026-08-21_12-06-20 is a kraft top with a pale tape strip across the middle,
+    and the mask took the tape plus the lower band, reporting 133 x 204 mm for a
+    face that is really 188 x 212. Depth is the only evidence that those bands
+    are ONE surface.
+
+    Rather than growing pixel-by-pixel (which sprays stereo speckle into the
+    mask -- see the reverted box_plateau_complete_* attempt), this scans the
+    face's own rows and columns: for each line, the fraction of its VALID depth
+    readings that lie at the face depth. That fraction holds near 1.0 across the
+    whole face and collapses within a few pixels at the real edge, regardless of
+    banding, dropouts or how much of the face SAM2 found. The face is the longest
+    run above cfg.box_face_extent_min_line_fraction in each axis.
+
+    Returns an axis-aligned mask of that extent, or None when refinement does not
+    apply or looks unsafe.
+    """
+    if not cfg.box_face_extent_refine_enable or face_depth_mm is None:
+        return None
+
+    ys, xs = np.where(mask == 1)
+
+    if ys.size == 0:
+        return None
+
+    # The scan is axis-aligned, so it can only describe a box that is close to
+    # square-on to the camera. On a visibly rotated box an axis-aligned extent
+    # would be the bounding box of a diamond -- larger than the face in both
+    # directions -- so SAM2's own rotated mask is kept instead.
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return None
+
+    (_, _), (rw, rh), rangle = cv2.minAreaRect(max(contours, key=cv2.contourArea))
+    off_axis = min(abs(rangle % 90.0), 90.0 - abs(rangle % 90.0))
+
+    if off_axis > cfg.box_face_extent_max_angle_deg:
+        print(
+            f"[box] face-extent refine skipped: box is {off_axis:.1f} deg off axis "
+            f"(cap {cfg.box_face_extent_max_angle_deg} deg) -- an axis-aligned "
+            f"extent would overstate a rotated face, keeping the original"
+        )
+        return None
+
+    valid = depth_roi > 0
+    on_face = (
+        np.abs(depth_roi.astype(np.float32) - float(face_depth_mm))
+        <= cfg.box_face_extent_tolerance_mm
+    ) & valid
+
+    def profile(axis, lo, hi):
+        out = []
+
+        for i in range(depth_roi.shape[axis]):
+            line_valid = valid[i, lo:hi] if axis == 0 else valid[lo:hi, i]
+            line_face = on_face[i, lo:hi] if axis == 0 else on_face[lo:hi, i]
+            n = int(line_valid.sum())
+            out.append(
+                float(line_face.sum() / n)
+                if n >= cfg.box_face_extent_min_line_samples
+                else np.nan
+            )
+
+        return np.array(out)
+
+    rows = _face_band(profile(0, xs.min(), xs.max() + 1),
+                      cfg.box_face_extent_min_line_fraction)
+    cols = _face_band(profile(1, ys.min(), ys.max() + 1),
+                      cfg.box_face_extent_min_line_fraction)
+
+    if rows is None or cols is None:
+        return None
+
+    refined = np.zeros_like(mask)
+    refined[rows[0]:rows[1] + 1, cols[0]:cols[1] + 1] = 1
+
+    original_area = int((mask == 1).sum())
+    refined_area = int(refined.sum())
+    growth = refined_area / max(original_area, 1)
+
+    # The refined extent must still contain most of what SAM2 found -- if it does
+    # not, the row/column scan locked onto something other than this mask's face.
+    #
+    # Judged on the DROPPED pixels rather than a bare overlap ratio: SAM2 spills
+    # slightly over the box edge onto the tray, and dropping that spill is the
+    # refinement working, not failing. Measured on the two captures with saved
+    # depth, both keep 91% of the mask, and of the ~6.5k pixels excluded only
+    # 2-4% are on the box face -- i.e. what gets dropped really is off-face. Only
+    # if a large share of the dropped pixels ARE on-face has the scan mistakenly
+    # cut into the real face.
+    kept = float((refined[mask == 1] == 1).mean())
+    dropped = (mask == 1) & (refined == 0)
+    dropped_count = int(dropped.sum())
+    dropped_on_face = (
+        float(on_face[dropped].sum() / dropped_count) if dropped_count else 0.0
+    )
+
+    if dropped_on_face > cfg.box_face_extent_max_dropped_on_face:
+        print(
+            f"[box] face-extent refine skipped: {dropped_on_face:.0%} of the "
+            f"{dropped_count} px it would drop are on the box face (cap "
+            f"{cfg.box_face_extent_max_dropped_on_face:.0%}) -- the scan is cutting "
+            f"into the real face, keeping the original"
+        )
+        return None
+
+    if kept < cfg.box_face_extent_min_original_kept:
+        print(
+            f"[box] face-extent refine skipped: the scanned extent keeps only "
+            f"{kept:.0%} of SAM2's mask (need "
+            f"{cfg.box_face_extent_min_original_kept:.0%}) -- keeping the original"
+        )
+        return None
+
+    if growth > cfg.box_face_extent_max_area_growth:
+        print(
+            f"[box] face-extent refine skipped: would grow the mask {growth:.2f}x "
+            f"(cap {cfg.box_face_extent_max_area_growth}x) -- keeping the original"
+        )
+        return None
+
+    if growth < cfg.box_face_extent_min_area_growth:
+        return None
+
+    print(
+        f"[box] face-extent refine: {original_area} -> {refined_area} px "
+        f"({growth:.2f}x) -- rows {rows[0]}-{rows[1]}, cols {cols[0]}-{cols[1]} "
+        f"at the {face_depth_mm} mm face"
+    )
+
+    return refined
+
+
 def complete_box_mask_to_depth_plateau(cfg, mask, depth_roi, face_depth_mm):
     """Grow `mask` into every connected pixel lying at `face_depth_mm`.
 
@@ -187,6 +350,15 @@ def complete_box_mask_to_depth_plateau(cfg, mask, depth_roi, face_depth_mm):
 
     completed = np.isin(labels, hit).astype(np.uint8)
     completed = ((completed == 1) | (mask == 1)).astype(np.uint8)
+
+    # Shed the thin tendrils a leak over the box edge produces, so they are not
+    # measured. A solid face survives this; a filament does not. The original
+    # mask is unioned back in afterwards so opening can only ever remove pixels
+    # the growth ADDED, never erode what SAM2 actually found.
+    if cfg.box_plateau_open_kernel_px > 1:
+        ko = np.ones((cfg.box_plateau_open_kernel_px,) * 2, np.uint8)
+        completed = cv2.morphologyEx(completed, cv2.MORPH_OPEN, ko)
+        completed = ((completed == 1) | (mask == 1)).astype(np.uint8)
 
     completed_area = int(completed.sum())
     growth = completed_area / max(original_area, 1)
@@ -850,12 +1022,19 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
         box_candidates.append(candidate)
 
         if cfg.debug_print_masks:
+            # flush=True: this runs inside a ros2-launched node, whose stdout is
+            # a pipe and therefore block-buffered, not line-buffered. Without the
+            # flush these lines sit in the buffer and only appear when the
+            # process exits -- which looks exactly like the print never ran.
+            x, y, w, h = candidate["bbox"]
             print(
                 f"mask={i:03d} "
                 f"score={candidate['score']:.3f} "
                 f"area={candidate['area_ratio']:.3f} "
                 f"rect={candidate['rectangularity']:.3f} "
-                f"color={candidate['color_score']:.3f}"
+                f"color={candidate['color_score']:.3f} "
+                f"bbox=({x},{y},{w},{h})",
+                flush=True,
             )
 
     if len(box_candidates) == 0:
@@ -885,7 +1064,33 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
         print(f"  area growth:        {best_merged['merged_area_growth']:.3f}")
         print(f"  merged score:       {best_merged['score']:.3f}")
 
-        if selected is None or best_merged["score"] > selected["score"]:
+        # A merge only wins if it actually covers MORE than the best single
+        # mask. box_merge_score_bonus (0.85) is added to every successful merge
+        # so a genuinely split box can beat a partial -- but nothing checked that
+        # the merge was the bigger thing, so two fragments from the SAME side of
+        # a seam could stack into a still-partial mask and the bonus alone would
+        # carry it past a correct full-face candidate.
+        #
+        # Observed 2026-08-28 on camera_2: the full face scored 6.271 at
+        # bbox=(113,159,345,338), while mask000 (h=100) merged with mask088
+        # (h=134) produced a 224 px result that won on the bonus and reported
+        # 128.7 mm for a 204 mm box. Three consecutive live runs, all identical.
+        if best_merged is not None and selected is not None:
+            merged_area = int(best_merged["mask"].sum())
+            single_area = int(selected["mask"].sum())
+
+            if merged_area <= single_area:
+                print(
+                    f"  merge REJECTED: {merged_area} px does not exceed the best "
+                    f"single mask's {single_area} px -- a merge that recovers less "
+                    f"than one mask already found is not a repair",
+                    flush=True,
+                )
+                best_merged = None
+
+        if best_merged is not None and (
+            selected is None or best_merged["score"] > selected["score"]
+        ):
             selected = best_merged
 
     multiface = build_multiface_cardboard_box_candidate(
@@ -968,9 +1173,14 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
 
     # Complete a mask that stopped part-way across the box top, then re-measure
     # everything from the completed mask. See cfg.box_plateau_complete_enable.
-    completed_mask = complete_box_mask_to_depth_plateau(
+    completed_mask = refine_box_mask_to_face_extent(
         cfg, box["mask"], depth_roi_scaled, box_face_depth
     )
+
+    if completed_mask is None:
+        completed_mask = complete_box_mask_to_depth_plateau(
+            cfg, box["mask"], depth_roi_scaled, box_face_depth
+        )
 
     if completed_mask is not None:
         box = dict(box)
@@ -1009,6 +1219,11 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
 
     return {
         "roi_rgb": roi_rgb,
+        # Raw measurement-stereo depth over the ROI, saved to the debug dir as a
+        # 16-bit PNG so mask/depth problems can be diagnosed and any fix tested
+        # against REAL depth offline. Reconstructing it synthetically hid the
+        # stereo speckle that broke the first plateau-completion attempt.
+        "depth_roi": depth_roi_scaled,
         "box": box,
         "center_full": center_full,
         "box_face_depth_mm": box_face_depth,

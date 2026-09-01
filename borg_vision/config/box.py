@@ -109,11 +109,104 @@ class BoxConfig(BaseConfig):
     # Bounded by box_plateau_max_area_growth so it can only complete a face, not
     # run away onto a same-height neighbour; growth beyond that is treated as
     # evidence the plateau is not the box and the original mask is kept.
-    box_plateau_complete_enable: bool = True
-    box_plateau_tolerance_mm: float = 12.0
+    # DEFAULT OFF as of 2026-08-21. The idea -- grow a partial mask into the
+    # connected depth plateau -- repaired capture 10-07-21 (124 -> 204 mm) but
+    # then CORRUPTED good frames: the measurement stereo is speckly at the box
+    # edges, so a per-pixel depth predicate sprays holes and stray pixels instead
+    # of completing a face, and minAreaRect wraps the outermost speck. Capture
+    # 10-44-29 shows it plainly -- SAM2's own mask is the clean right-hand
+    # rectangle, the ragged left third is this growth, and the reading inflated
+    # to 214 x 203 for a box measuring ~208 x 203.
+    #
+    # Tightening the tolerance (12 -> 5 mm) and adding a morphological open did
+    # not fix it: the noise is dense enough to survive opening as connected
+    # blobs, and the original mask is unioned back in afterwards regardless.
+    #
+    # A working version of this idea has to fit a PLANE/rectangle to the plateau
+    # rather than threshold per pixel -- see how polymailer product_inside does
+    # it. Until then the partial-mask failure is better handled by re-running the
+    # detection, which recovers it in practice.
+    box_plateau_complete_enable: bool = False
+
+    # ----- box face extent refinement -----------------------------------
+    # Replaces a mask that covers only PART of the box top with the face's full
+    # extent, measured from depth. See refine_box_mask_to_face_extent.
+    #
+    # The problem it solves: SAM2 segments on appearance, so a box top with
+    # tonal bands -- a tape strip, printing, a lighting seam -- is seen as
+    # several regions and the mask keeps only some. Capture 2026-08-21_12-06-20
+    # reported 133 x 204 mm for a face measuring 188 x 212. Re-running the
+    # detection usually recovers it, but not reliably.
+    #
+    # Why this and not the reverted box_plateau_complete_* approach: that grew
+    # the mask pixel-by-pixel through a depth threshold, which sprayed stereo
+    # speckle into the mask and inflated readings to 214-217 mm. This scans
+    # whole rows and columns instead -- for each line, the fraction of its VALID
+    # readings sitting at the face depth. Measured on the capture above that
+    # fraction holds ~1.0 right across the face and collapses to 0.00 within six
+    # pixels of the real edge, so the boundary is unambiguous and per-pixel
+    # noise averages out. Dropouts are excluded rather than counted as misses,
+    # which is what stalled the second attempt.
+    #
+    # Produces an AXIS-ALIGNED extent, so it is only applied to a box that is
+    # close to square-on (box_face_extent_max_angle_deg); a visibly rotated box
+    # keeps SAM2's own rotated mask.
+    # DEFAULT OFF as of 2026-08-21. The row/column scan finds the face extent
+    # correctly IN DEPTH SPACE, but the result is applied as a mask in RGB
+    # space, so any residual depth-to-RGB misalignment lands directly in the
+    # mask edges. On capture 2026-08-21_12-17-04 the refined extent measured a
+    # plausible 187 x 213 mm, yet the mask visibly sat high and right of the
+    # box: cols 130-484 against a true ~133-467, rows 180-491 against ~170-515
+    # -- 10 to 24 px out, i.e. 6-14 mm. Good numbers, wrong pixels.
+    #
+    # Re-enabling this needs the depth alignment verified first (see
+    # depth_align_* above): measure a box's edges in raw_rgb.jpg and in
+    # depth_roi_mm.png and confirm they coincide. Until they do, any depth-space
+    # mask repair inherits the same offset.
+    box_face_extent_refine_enable: bool = False
+    box_face_extent_tolerance_mm: float = 6.0
+    # 0.65, NOT a high value. On the face this fraction sits at 0.77-0.95 --
+    # it wobbles, because the mask's own rows include some off-face pixels --
+    # while at the real box edge it collapses to 0.00 within a few pixels. The
+    # threshold therefore belongs in the middle of that gap, not near the top:
+    # at 0.80 a normal dip to 0.78 chopped a face in half (190 x 103 mm instead
+    # of 190 x 212). Swept on both saved captures, 0.65 and 0.50 give the same
+    # answer to ~1 mm, so this sits on a plateau rather than an edge.
+    box_face_extent_min_line_fraction: float = 0.65
+    box_face_extent_min_line_samples: int = 20
+    box_face_extent_min_area_growth: float = 1.05
+    box_face_extent_max_area_growth: float = 3.0
+    box_face_extent_min_original_kept: float = 0.70
+
+    # Cap on the share of DROPPED pixels that may sit on the box face. Dropping
+    # SAM2's spill over the box edge is correct (measured: 2-4% of the dropped
+    # pixels are on-face); dropping real face is not.
+    box_face_extent_max_dropped_on_face: float = 0.35
+    box_face_extent_max_angle_deg: float = 8.0
+
+    # DELIBERATELY tighter than box_face_depth_tolerance_mm (12.0). That one asks
+    # "are these samples all one surface?", where a wide band is right. This one
+    # GROWS the mask, and 12 mm of slack let the plateau bleed over the box edge
+    # onto the tray: capture 2026-08-21_10-38-09 came back 217.0 x 206.7 mm for a
+    # box measuring 206-208 x 202-203 on the four runs around it, with the mask
+    # visibly outside the depth plateau on two edges. A box top sits ~105 mm above
+    # the tray, so a few mm is ample to span the face's own noise without
+    # reaching anything else.
+    box_plateau_tolerance_mm: float = 5.0
+
     box_plateau_max_area_growth: float = 2.5
     box_plateau_min_area_growth: float = 1.05
-    box_plateau_close_kernel_px: int = 7
+
+    # Bridges stereo dropouts inside the face. Kept small: a large kernel closes
+    # ACROSS the box edge and joins the face to whatever leaked through beside
+    # it, which is the other half of the 10-38-09 overshoot.
+    box_plateau_close_kernel_px: int = 3
+
+    # After growing, erode-then-dilate the completed mask to shed the thin
+    # tendrils a leak produces before they are measured. A genuine face is a
+    # solid rectangle and survives this unchanged; a filament that squeezed
+    # through a gap in the box edge does not.
+    box_plateau_open_kernel_px: int = 5
 
     # Cardboard-box mask gating & scoring.
     min_box_area_ratio: float = 0.04
@@ -207,4 +300,9 @@ class BoxConfig(BaseConfig):
     secondary_face_max_aspect_ratio: float = 10.0
     secondary_face_min_center_score: float = 0.12
 
+    # Set True to print every scored candidate (score, area, rect, colour, bbox)
+    # during a detection. That output is what found the 2026-08-28 merge bug --
+    # it showed the correct full-face mask scoring highest yet losing to a merged
+    # pair of fragments. Worth turning on first whenever the selected mask is not
+    # the one you expect.
     debug_print_masks: bool = False
