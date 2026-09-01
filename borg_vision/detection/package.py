@@ -640,6 +640,25 @@ def normalized_rect_angle(rotated):
     return angle
 
 
+def cardboard_color_score(roi_rgb, mask):
+    """Cardboard-tone score of a mask, 0..1.
+
+    Same HSV formula as score_cardboard_box_mask (keep the two in sync); split
+    out so merge paths can judge a fragment that never went through the full
+    box scorer."""
+    hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
+    masked = hsv[mask.astype(bool)]
+    if masked.size == 0:
+        return 0.0
+    mean_h = float(np.mean(masked[:, 0]))
+    mean_s = float(np.mean(masked[:, 1]))
+    mean_v = float(np.mean(masked[:, 2]))
+    hue_score = 1.0 - min(abs(mean_h - 18.0) / 30.0, 1.0)
+    sat_score = 1.0 - min(abs(mean_s - 65.0) / 100.0, 1.0)
+    val_score = 1.0 - min(abs(mean_v - 170.0) / 120.0, 1.0)
+    return 0.50 * hue_score + 0.25 * sat_score + 0.25 * val_score
+
+
 def build_multiface_cardboard_box_candidate(
     cfg,
     box_candidates,
@@ -652,6 +671,16 @@ def build_multiface_cardboard_box_candidate(
     if not box_candidates or not package_candidates:
         return None
 
+    # Same fragment-quality bar as the split-mask merge: a hull anchored on a
+    # weak "box" fragment can only invent geometry.
+    box_candidates = [
+        c for c in box_candidates
+        if (c.get("color_score") or 0.0) >= cfg.box_merge_min_fragment_color_score
+        and (c.get("rectangularity") or 0.0) >= cfg.box_merge_min_fragment_rectangularity
+    ]
+    if not box_candidates:
+        return None
+
     boxes = sorted(
         box_candidates,
         key=lambda item: item.get("score", 0.0),
@@ -662,6 +691,17 @@ def build_multiface_cardboard_box_candidate(
         key=lambda item: item.get("area", int(item["mask"].sum())),
         reverse=True,
     )[:cfg.box_multiface_max_candidates]
+
+    # The package-side fragment never went through the box color gate; a
+    # carpet patch beside the box qualifies geometrically, so require the
+    # second face to actually look like cardboard.
+    packages = [
+        p for p in packages
+        if cardboard_color_score(roi_rgb, p["mask"])
+        >= cfg.box_multiface_min_second_color_score
+    ]
+    if not packages:
+        return None
 
     roi_area = roi_rgb.shape[0] * roi_rgb.shape[1]
     best = None
@@ -750,6 +790,18 @@ def build_multiface_cardboard_box_candidate(
 def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
     if not cfg.box_merge_split_masks_enable:
         return None
+
+    if len(box_candidates) < 2:
+        return None
+
+    # Only box-like fragments may merge: see box_merge_min_fragment_* in the
+    # config for the failure this guards against (complete box + background
+    # strip, rectangle-completed into an oversized "box").
+    box_candidates = [
+        c for c in box_candidates
+        if (c.get("color_score") or 0.0) >= cfg.box_merge_min_fragment_color_score
+        and (c.get("rectangularity") or 0.0) >= cfg.box_merge_min_fragment_rectangularity
+    ]
 
     if len(box_candidates) < 2:
         return None

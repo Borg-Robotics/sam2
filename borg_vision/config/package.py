@@ -99,6 +99,15 @@ class PackageConfig(BaseConfig):
     box_merge_min_area_growth_over_largest: float = 1.20
     box_merge_min_result_rectangularity: float = 0.72
     box_merge_score_bonus: float = 0.85
+    # A merge partner must itself look like a piece of cardboard box. The
+    # 2026-09-01 rotated-box failure glued the COMPLETE box (color 0.82,
+    # rect 0.96, already the exact-rules winner) to a roller/carpet strip
+    # (color 0.51, rect 0.62); rectangle completion made the union a perfect
+    # rect and the inflated score beat the correct candidate by 1.3. Real
+    # split-box halves measure color ~0.8 and rect ~0.9, so these floors cost
+    # nothing on genuine splits.
+    box_merge_min_fragment_color_score: float = 0.60
+    box_merge_min_fragment_rectangularity: float = 0.70
 
     # ----- rotated split-mask merge (angled boxes split along a seam) ---
     # Fallback pairing rule for build_merged_cardboard_box_candidate: when a
@@ -122,6 +131,11 @@ class PackageConfig(BaseConfig):
     box_multiface_min_union_fill_ratio: float = 0.58
     box_multiface_max_hull_area_ratio: float = 0.72
     box_multiface_score_bonus: float = 1.10
+    # The multiface hull's second fragment is a PACKAGE candidate, which has
+    # no color gate of its own -- a carpet patch next to the box qualifies
+    # geometrically. Require cardboard color on it (and the box fragment is
+    # held to the box_merge fragment floors above).
+    box_multiface_min_second_color_score: float = 0.60
 
     # ----- segmentation box-type override / thin-polymailer veto -------
     box_type_segmentation_override_enable: bool = True
