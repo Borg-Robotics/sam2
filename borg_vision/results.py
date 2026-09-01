@@ -50,6 +50,11 @@ class PackageResult(BaseResult):
     product_inside_center_pixel_u: Optional[int] = None
     product_inside_center_pixel_v: Optional[int] = None
     product_inside_depth_mm: Optional[float] = None
+    # Ranked fallback grasp points near the product_inside centre (dicts with
+    # x_mm/y_mm/z_mm/score), best first. RETRIES ONLY: the primary grasp is
+    # product_inside_center and is not repeated here. Empty when no product
+    # was found or nothing scoreable sat even half a cup from the centre.
+    product_inside_grasp_candidates: list = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw, frames):

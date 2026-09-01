@@ -3041,6 +3041,41 @@ def run_sam_package_depth_type(
             "threshold_mm": None,
         }
 
+    # Fallback grasp points for the product inside: ranked alternatives for
+    # when the cup fails to seal on the primary point. The primary is and
+    # stays product_inside_center -- these are RETRIES ONLY, the best-scoring
+    # other spots (no cup-width spacing rule, operator's call), kept only far
+    # enough from the centre to be a different spot at all. Scored by the
+    # object-mode scorer over the product mask (PackageConfig carries the
+    # obj_grasp_* fields it reads).
+    product_inside_grasp_candidates = []
+    if product_inside["found"] and product_inside["center_roi"] is not None:
+        from .object import score_object_grasp_candidates
+
+        scored = score_object_grasp_candidates(
+            cfg,
+            {"mask": product_inside["mask"]},
+            product_inside["center_roi"],
+            depth_class_roi,
+            product_inside["depth_mm"] or top_face_depth_mm,
+            None,
+            intrinsics,
+        )
+        for c in scored:
+            if c.get("offset_mm", 0.0) < cfg.product_inside_grasp_min_offset_mm:
+                continue
+            product_inside_grasp_candidates.append(
+                {
+                    "x_mm": c.get("x_mm"),
+                    "y_mm": c.get("y_mm"),
+                    "z_mm": c.get("z_mm"),
+                    "score": c.get("score"),
+                    "point_full": c.get("point_full"),
+                }
+            )
+            if len(product_inside_grasp_candidates) >= cfg.product_inside_grasp_retry_count:
+                break
+
     heatmap = make_package_depth_heatmap(
         cfg,
         depth_roi=depth_class_roi,
@@ -3076,6 +3111,7 @@ def run_sam_package_depth_type(
             else None
         ),
         "product_inside_depth_mm": product_inside["depth_mm"],
+        "product_inside_grasp_candidates": product_inside_grasp_candidates,
     }
 
     print()

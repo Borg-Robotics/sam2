@@ -320,6 +320,43 @@ class PackageConfig(BaseConfig):
     product_inside_min_valid_pixels: int = 80
     product_inside_max_peak_mm: float = 90.0
 
+    # ----- product-inside suction-cup fallback grasp points ----------------
+    # Ranked alternatives near the product_inside centre for when the cup
+    # fails to seal on the primary point. Scored by the object-mode grasp
+    # scorer (score_object_grasp_candidates), which reads these obj_grasp_*
+    # and center-depth fields off whatever config it is handed -- the names
+    # therefore MUST match ObjectConfig's. The primary grasp stays the
+    # product_inside centre; the fallbacks are simply the best-scoring other
+    # spots (operator's call 2026-09-01: no full-cup spacing rule), kept only
+    # far enough from the centre and each other to be different film at all.
+    obj_grasp_cup_diameter_mm: float = 30.0
+    obj_grasp_edge_margin_mm: float = 5.0
+    obj_grasp_max_offset_mm: float = 55.0
+    obj_grasp_grid_step_px: int = 6
+    obj_grasp_min_valid_px: int = 30
+    obj_grasp_min_valid_frac: float = 0.60
+    obj_grasp_min_depth_levels: int = 3
+    # More than the wire needs: the centre-separation filter thins this list
+    # down to product_inside_grasp_retry_count afterwards.
+    obj_grasp_max_candidates: int = 6
+    # Spacing between kept candidates, in cup radii (1.0 = half a cup: the
+    # next candidate's centre clears the previous cup's rim). Object mode
+    # uses 2.0; the operator wants product fallbacks purely score-ranked.
+    obj_grasp_min_sep_radii: float = 1.0
+    obj_grasp_w_rough: float = 0.35
+    obj_grasp_w_tilt: float = 0.15
+    obj_grasp_w_centre: float = 0.45
+    obj_grasp_w_edge: float = 0.05
+    # Center-depth sampling for candidate z (same names as ObjectConfig).
+    center_depth_radius_px: int = 35
+    min_center_depth_count: int = 30
+    # How many fallbacks to report after the separation filter.
+    product_inside_grasp_retry_count: int = 2
+    # A fallback must sit at least this far from the primary point -- not a
+    # spacing preference, just "a different spot at all" (half a cup, so the
+    # retry's centre is off the failed cup's footprint).
+    product_inside_grasp_min_offset_mm: float = 15.0
+
     heatmap_max_closer_than_base_mm: float = 180.0
 
     debug_print_masks: bool = False
