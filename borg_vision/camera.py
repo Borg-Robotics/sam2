@@ -106,6 +106,41 @@ def get_rgb_intrinsics(cfg, device):
         return None
 
 
+def _apply_stereo_quality(cfg, stereo, label):
+    """Preset + subpixel precision for one StereoDepth node.
+
+    Order matters: setDefaultProfilePreset RESETS the node's config, so it
+    must run before the individual setters; the caller then applies
+    LR-check/subpixel/confidence, and _apply_subpixel_bits runs last."""
+    name = (cfg.stereo_preset or "FAST_DENSITY").strip().upper()
+    preset = getattr(dai.node.StereoDepth.PresetMode, name, None)
+    if preset is None:
+        print(f"Unknown stereo preset {name!r}; using FAST_DENSITY")
+        preset = dai.node.StereoDepth.PresetMode.FAST_DENSITY
+        name = "FAST_DENSITY"
+    stereo.setDefaultProfilePreset(preset)
+    print(f"{label} stereo preset: {name}")
+
+
+def _apply_subpixel_bits(cfg, stereo, label):
+    """Raise disparity fractional bits (finer depth steps). 0 = leave default.
+
+    Applied AFTER setSubpixel so nothing resets it. API location varies by
+    depthai version, hence the two attempts."""
+    bits = int(cfg.stereo_subpixel_bits or 0)
+    if bits <= 0:
+        return
+    try:
+        stereo.initialConfig.setSubpixelFractionalBits(bits)
+        print(f"{label} subpixel fractional bits: {bits}")
+    except Exception:
+        try:
+            stereo.setSubpixelFractionalBits(bits)
+            print(f"{label} subpixel fractional bits: {bits}")
+        except Exception as e:
+            print(f"Could not set {label} subpixel bits: {e}")
+
+
 def _frame_timer():
     """Stage timer for get_frames, active only under BORG_TIME_FRAMES=1."""
     import os
@@ -192,9 +227,10 @@ class OakCamera:
         )
 
         stereo_class = pipeline.create(dai.node.StereoDepth)
-        stereo_class.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+        _apply_stereo_quality(cfg, stereo_class, "classification")
         stereo_class.setLeftRightCheck(cfg.use_left_right_check)
         stereo_class.setSubpixel(cfg.use_subpixel)
+        _apply_subpixel_bits(cfg, stereo_class, "classification")
 
         try:
             stereo_class.setOutputSize(cfg.rgb_size[0], cfg.rgb_size[1])
@@ -236,9 +272,10 @@ class OakCamera:
             )
 
             stereo_measure = pipeline.create(dai.node.StereoDepth)
-            stereo_measure.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
+            _apply_stereo_quality(cfg, stereo_measure, "measurement")
             stereo_measure.setLeftRightCheck(cfg.use_left_right_check)
             stereo_measure.setSubpixel(cfg.use_subpixel)
+            _apply_subpixel_bits(cfg, stereo_measure, "measurement")
 
             try:
                 stereo_measure.initialConfig.setConfidenceThreshold(cfg.confidence_threshold)

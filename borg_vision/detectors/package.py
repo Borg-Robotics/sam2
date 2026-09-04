@@ -114,6 +114,65 @@ class PackageDetector(BaseDetector):
         np.save(str(depth_measure_path), result.frames.depth_measure_aligned)
         np.save(str(depth_class_path), result.frames.depth_class_aligned)
 
+        # Product height view for the NEW locator work: ABSOLUTE height above
+        # the table (base_depth - depth), colors stretched over the mailer's
+        # own range. NOT plane-fit elevation -- the operator spotted that a
+        # product propping up one end of the mailer IS the "tilt", so a
+        # fitted reference plane subtracts the product's own signal and
+        # leaves only the central air bubble. Purely a debug artifact.
+        try:
+            from ..detection.product_depth import build_depth_bundle
+
+            bundle = build_depth_bundle(
+                cfg,
+                result.frames.depth_class_aligned,
+                result.frames.depth_measure_aligned,
+                result.raw["mask"],
+                self.camera.intrinsics if self.camera is not None else None,
+            )
+            if bundle is not None:
+                h = bundle["height_above_base"]
+                m = bundle["mailer"]
+                lo, hi = np.nanpercentile(h[m], [2, 99])
+                scaled = np.nan_to_num(
+                    np.clip((h - lo) / max(hi - lo, 1e-3), 0, 1), nan=0.0
+                )
+                vis = cv2.applyColorMap(
+                    (scaled * 255).astype(np.uint8), cv2.COLORMAP_TURBO
+                )
+                vis[~np.isfinite(h)] = (20, 20, 20)
+
+                # Locator overlay: white = product region, black = grab
+                # region, cross = the reported grasp point.
+                from ..detection.product_depth import locate_product
+
+                located = locate_product(cfg, bundle)
+                if located is not None:
+                    for lm, col, w in (
+                        (located["product_mask"], (255, 255, 255), 2),
+                        (located["grab_mask"], (0, 0, 0), 3),
+                    ):
+                        if lm is None:
+                            continue
+                        cnts, _ = cv2.findContours(
+                            lm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                        )
+                        cv2.drawContours(vis, cnts, -1, col, w)
+                    gc = located["grab_center"] or located["product_center"]
+                    cv2.drawMarker(vis, gc, (255, 255, 255), cv2.MARKER_CROSS, 26, 2)
+
+                cv2.putText(
+                    vis,
+                    f"height above table {lo:.0f}..{hi:.0f} mm  noise {bundle['noise_mm']:.2f} mm",
+                    (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2,
+                )
+                elev_path = save_dir / artifact_name(
+                    "product_height", "png", timestamp, organized
+                )
+                cv2.imwrite(str(elev_path), vis)
+        except Exception as exc:  # noqa: BLE001 - a debug view must never break saving
+            print(f"product_height view skipped: {exc}")
+
         if cfg.debug_save_all_accepted_masks:
             save_accepted_masks(save_dir, timestamp, result.raw, organized)
 

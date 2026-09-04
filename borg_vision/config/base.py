@@ -38,6 +38,15 @@ class BaseConfig:
     use_subpixel: bool = True
     use_left_right_check: bool = True
 
+    # On-device stereo quality (StereoDepth.PresetMode name). FAST_DENSITY is
+    # the long-standing default; HIGH_DETAIL does finer matching + filtering
+    # on the camera itself (no host cost). Unknown names fall back to
+    # FAST_DENSITY with a printed warning.
+    stereo_preset: str = "FAST_DENSITY"
+    # Subpixel fractional bits (3 = camera default ~1.5 mm depth steps at
+    # 660 mm; 5 = ~0.4 mm). 0 leaves the camera default untouched.
+    stereo_subpixel_bits: int = 0
+
     use_manual_stereo_exposure: bool = True
     stereo_exposure_us: int = 1000
     stereo_iso: int = 400

@@ -3065,13 +3065,35 @@ def run_sam_package_depth_type(
         # stream's 640x400, which halves depth quantisation, and it carries
         # 97-98% valid pixels on the mailer against 91-94% -- the dropouts being
         # what tore holes in the footprint in the first place.
-        product_inside = detect_product_inside_polymailer(
-            cfg,
-            depth_roi=depth_class_roi,
-            package_mask=best["mask"],
-            center_full_depth_mm=top_face_depth_mm,
-            intrinsics=intrinsics,
-        )
+        if cfg.product_inside_enable:
+            product_inside = detect_product_inside_polymailer(
+                cfg,
+                depth_roi=depth_class_roi,
+                package_mask=best["mask"],
+                center_full_depth_mm=top_face_depth_mm,
+                intrinsics=intrinsics,
+            )
+        elif cfg.locator_enable:
+            # NEW height-band locator (2026-09-03): absolute height above the
+            # table, two nested single-blob segments, grasp at the grab-blob
+            # centroid. Needs the FULL-frame streams (it crops internally).
+            from .product_depth import locate_product_inside
+
+            product_inside = locate_product_inside(
+                cfg,
+                depth_class_aligned,
+                depth_measure_aligned,
+                best["mask"],
+                intrinsics,
+            )
+        else:
+            product_inside = detect_product_inside_polymailer(
+                cfg,
+                depth_roi=depth_class_roi,
+                package_mask=best["mask"],
+                center_full_depth_mm=top_face_depth_mm,
+                intrinsics=intrinsics,
+            )
     else:
         product_inside = {
             "found": False,

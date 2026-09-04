@@ -219,7 +219,13 @@ class PackageConfig(BaseConfig):
     # are RELATIVE (fractions of the package span or the dome height); the
     # plane tolerances are millimetres because they describe how far film can
     # physically sit from a rigid top it is touching.
-    product_inside_enable: bool = True
+    # OFF 2026-09-03 (operator's call): the facet-plane detector below is
+    # retired in place while its replacement is built from scratch on the
+    # single-shot depth bundle (detection/product_depth.py). All its code and
+    # tuning stay intact -- flip this back to True to compare old vs new.
+    # While False, every polymailer detection reports product_inside_found =
+    # false (reason "disabled"), so the BT's phase-1 pick has NO grasp point.
+    product_inside_enable: bool = False
 
     # Border band excluded from the search, as a fraction of the package span
     # (sqrt of its area). Keeps the drooping mailer edge out of the plane fit.
@@ -384,6 +390,33 @@ class PackageConfig(BaseConfig):
     # spacing preference, just "a different spot at all" (half a cup, so the
     # retry's centre is off the failed cup's footprint).
     product_inside_grasp_min_offset_mm: float = 15.0
+
+    # ----- NEW product locator (stage 2): height-band segmentation --------
+    # Operator-specified 2026-09-03. Two nested segments from the ABSOLUTE
+    # height-above-table map: the PRODUCT region (red / light red / dark
+    # orange = upper part of the mailer's own height range) and, inside it,
+    # the GRAB region (dark red = the very top band). Fractions are of the
+    # frame's robust height range (p2..p99), so they self-scale to any
+    # product height. Each segment is forced to ONE solid blob: small
+    # opening drops lone specks, a closing merges the dense speckle cluster,
+    # the largest piece wins, holes are filled.
+    # The height-band locator is the LIVE product_inside source while the
+    # legacy detector is disabled (product_inside_enable False). If both are
+    # enabled, legacy wins -- flip product_inside_enable to compare.
+    locator_enable: bool = True
+    locator_product_band_frac: float = 0.70
+    locator_grab_band_frac: float = 0.88
+    locator_open_mm: float = 4.0
+    locator_close_mm: float = 14.0
+    locator_min_region_px: int = 400
+    # Appendage trim on the finished blob: thin legs (narrower than
+    # 2 x trim_open_mm) that survive the close get shaved off so they cannot
+    # drag the centre -- operator spec 2026-09-03 (run 15-00-08: two thin
+    # legs pulled the grab centre toward the edge). Only applies when the
+    # remaining body keeps at least trim_min_area_frac of the blob;
+    # otherwise the blob is genuinely thin and stays whole.
+    locator_trim_open_mm: float = 12.0
+    locator_trim_min_area_frac: float = 0.55
 
     heatmap_max_closer_than_base_mm: float = 180.0
 
