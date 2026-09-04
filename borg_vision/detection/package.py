@@ -6,6 +6,8 @@ module-level constants replaced by fields of a PackageConfig passed as the
 first argument. Function bodies are otherwise unchanged.
 """
 
+import warnings
+
 import cv2
 import numpy as np
 import torch
@@ -3077,8 +3079,6 @@ def run_sam_package_depth_type(
             # NEW height-band locator (2026-09-03): absolute height above the
             # table, two nested single-blob segments, grasp at the grab-blob
             # centroid. Needs the FULL-frame streams (it crops internally).
-            from .product_depth import locate_product_inside
-
             product_inside = locate_product_inside(
                 cfg,
                 depth_class_aligned,
@@ -3267,3 +3267,327 @@ def run_sam_package_depth_type(
         "depth_heatmap": heatmap,
         "barcode": barcode,
     }
+
+
+# =========================================================================
+# NEW product-inside locator (2026-09-03): height-band segmentation on the
+# ABSOLUTE height-above-table map. Lives here (not a separate module) so it
+# is covered by the same tracked file as the rest of package detection.
+# Operator insight behind it: a product under one end PROPS THE MAILER UP --
+# the "tilt" largely IS the product, so plane-relative elevation subtracts
+# the signal; height above the level table keeps it.
+# =========================================================================
+
+def build_depth_bundle(cfg, depth_class_aligned, depth_measure_aligned, package_mask, intrinsics):
+    """Assemble the single-shot depth bundle the new locator will work from.
+
+    Args:
+        cfg: PackageConfig (ROI, valid-depth bounds, plane-fit settings).
+        depth_class_aligned: full-frame RGB-aligned uint16 classification
+            depth -- the frame the detection ran on.
+        depth_measure_aligned: full-frame measurement-stereo depth (uint16),
+            or None.
+        package_mask: mailer mask in ROI coordinates (uint8).
+        intrinsics: {"fx", ...} or None.
+
+    Returns dict or None (not enough valid depth):
+        depth        ROI float32 mm, NaN where invalid
+        measure      ROI float32 mm or None, NaN where invalid
+        mailer       ROI bool, eroded mailer interior with valid depth
+        plane        ROI float32 mm, robust mailer reference plane
+        elevation    ROI float32 mm, plane - depth (positive = raised),
+                     raw, unsmoothed
+        elevation_smooth  ROI float32 mm, noise-suppressed elevation (the
+                     shipped detector's smoothing scale, for comparability)
+        noise_mm     float, this frame's own depth speckle (robust sigma of
+                     the high-pass residual) -- scale thresholds to this
+        mm_per_px    float or None
+    """
+    depth = depth_class_aligned[
+        cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2
+    ].astype(np.float32)
+    valid = (depth > cfg.min_valid_depth_mm) & (depth < cfg.max_valid_depth_mm)
+    depth = np.where(valid, depth, np.nan).astype(np.float32)
+
+    measure = None
+    if depth_measure_aligned is not None:
+        m = depth_measure_aligned[
+            cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2
+        ].astype(np.float32)
+        measure = np.where(
+            (m > cfg.min_valid_depth_mm) & (m < cfg.max_valid_depth_mm), m, np.nan
+        ).astype(np.float32)
+
+    package_mask = (package_mask > 0).astype(np.uint8)
+    span = float(np.sqrt(max(int(package_mask.sum()), 1)))
+    inner = erode_mask(
+        package_mask, max(1, int(round(span * cfg.product_inside_edge_erode_frac)))
+    )
+    mailer = (inner == 1) & valid
+
+    if int(mailer.sum()) < cfg.product_inside_min_valid_pixels:
+        return None
+
+    depth_for_fit = np.where(valid, depth, 0.0).astype(np.float32)
+    plane = fit_reference_plane(
+        depth_for_fit,
+        mailer,
+        max_points=cfg.product_inside_max_plane_points,
+        iterations=cfg.product_inside_plane_iterations,
+        trim_sigma=cfg.product_inside_plane_trim_sigma,
+    )
+
+    if plane is None:
+        return None
+
+    elevation = np.where(valid, plane - depth, np.nan).astype(np.float32)
+
+    # Noise-suppressed elevation at the shipped detector's scale, plus the
+    # frame's own speckle level measured from what the smoothing removed.
+    raw_for_blur = np.where(mailer, plane - depth_for_fit, 0.0).astype(np.float32)
+    smooth_px = max(2.0, span * cfg.product_inside_smooth_frac)
+    elevation_smooth, _ = masked_gaussian_blur(
+        raw_for_blur, mailer, smooth_px, return_support=True
+    )
+    high_pass = (raw_for_blur - elevation_smooth)[mailer]
+    noise_mm = float(1.4826 * np.median(np.abs(high_pass - np.median(high_pass))))
+    elevation_smooth = np.where(mailer, elevation_smooth, np.nan).astype(np.float32)
+
+    mm_per_px = None
+    if intrinsics is not None and intrinsics.get("fx"):
+        mm_per_px = float(np.nanmedian(depth[mailer])) / float(intrinsics["fx"])
+
+    # ABSOLUTE height above the table. Operator insight 2026-09-03: a product
+    # under one end PROPS THE MAILER UP -- the "tilt" largely IS the product,
+    # so the fitted plane's elevation subtracts the signal and leaves only
+    # the central air bubble. Height above the level table keeps it. (The
+    # fitted-plane elevation stays available for comparison; camera-axis
+    # tilt, if any, shows in height as a fixed gradient and can be
+    # calibrated per station later.)
+    height_above_base = np.where(
+        valid, float(cfg.base_depth_mm) - depth, np.nan
+    ).astype(np.float32)
+
+    return {
+        "depth": depth,
+        "measure": measure,
+        "mailer": mailer,
+        "plane": plane.astype(np.float32),
+        "elevation": elevation,
+        "elevation_smooth": elevation_smooth,
+        "height_above_base": height_above_base,
+        "noise_mm": max(noise_mm, 1e-3),
+        "mm_per_px": mm_per_px,
+    }
+
+
+def _solid_blob(cfg, band_mask, mm_per_px):
+    """Collapse a speckled band mask into ONE solid blob, or None.
+
+    Operator spec: no scattered blobs -- merge the densest speckle cluster
+    into a single region and ignore tiny outlying specks that would drag it.
+    Small opening kills lone specks, closing fuses the dense cluster, the
+    largest connected piece wins, holes are filled.
+    """
+    if mm_per_px is None or mm_per_px <= 0:
+        mm_per_px = 0.68
+
+    def _kernel(mm):
+        px = max(1, int(round(mm / mm_per_px)))
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px * 2 + 1, px * 2 + 1))
+
+    blob = band_mask.astype(np.uint8)
+    blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, _kernel(cfg.locator_open_mm))
+    blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, _kernel(cfg.locator_close_mm))
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(blob, 8)
+    if n <= 1:
+        return None
+    best = 1 + int(np.argmax(stats[1:, 4]))
+    if stats[best, 4] < cfg.locator_min_region_px:
+        return None
+
+    blob = (labels == best).astype(np.uint8)
+
+    # Appendage trim: thin legs that survived the close still drag the
+    # centroid. A stronger opening removes anything narrower than
+    # 2 x trim_open_mm; the cut only stands when the remaining body keeps
+    # most of the area (a genuinely thin blob stays whole).
+    if cfg.locator_trim_open_mm > 0:
+        trimmed = cv2.morphologyEx(blob, cv2.MORPH_OPEN, _kernel(cfg.locator_trim_open_mm))
+        tn, tlabels, tstats, _ = cv2.connectedComponentsWithStats(trimmed, 8)
+        if tn > 1:
+            tbest = 1 + int(np.argmax(tstats[1:, 4]))
+            if tstats[tbest, 4] >= cfg.locator_trim_min_area_frac * int(blob.sum()):
+                blob = (tlabels == tbest).astype(np.uint8)
+
+    contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(blob)
+    cv2.drawContours(filled, contours, -1, 1, thickness=-1)
+    return filled
+
+
+def locate_product(cfg, bundle):
+    """Stage-2 locator: nested height-band segments from the height map.
+
+    Segment 1 (PRODUCT): the upper part of the mailer's own height range --
+    "the product is in this region". Segment 2 (GRAB, inside segment 1): the
+    very top band -- "the area we can most likely grab from". Bands are
+    fractions of the frame's robust height range, so they self-scale to any
+    product. Both come back as single solid blobs (see _solid_blob).
+
+    Returns dict or None:
+        lo_mm, hi_mm          robust height range of the mailer this frame
+        product_thr_mm, grab_thr_mm   the two band thresholds
+        product_mask, grab_mask       ROI uint8, one solid blob each
+                                      (grab_mask may be None)
+        product_center, grab_center   ROI (x, y) blob centroids
+    """
+    h = bundle["height_above_base"]
+    m = bundle["mailer"]
+
+    vals = h[m & np.isfinite(h)]
+    if vals.size < cfg.locator_min_region_px:
+        return None
+
+    lo, hi = np.nanpercentile(vals, [2.0, 99.0])
+    if hi - lo < 1.0:
+        return None
+
+    product_thr = lo + cfg.locator_product_band_frac * (hi - lo)
+    grab_thr = lo + cfg.locator_grab_band_frac * (hi - lo)
+
+    finite = np.isfinite(h)
+    product_band = m & finite & (h >= product_thr)
+    product_mask = _solid_blob(cfg, product_band, bundle.get("mm_per_px"))
+    if product_mask is None:
+        return None
+
+    grab_band = (product_mask == 1) & finite & (h >= grab_thr)
+    grab_mask = _solid_blob(cfg, grab_band, bundle.get("mm_per_px"))
+
+    def _centroid(mask):
+        ys, xs = np.where(mask == 1)
+        return (int(round(xs.mean())), int(round(ys.mean())))
+
+    return {
+        "lo_mm": float(lo),
+        "hi_mm": float(hi),
+        "product_thr_mm": float(product_thr),
+        "grab_thr_mm": float(grab_thr),
+        "product_mask": product_mask,
+        "grab_mask": grab_mask,
+        "product_center": _centroid(product_mask),
+        "grab_center": _centroid(grab_mask) if grab_mask is not None else None,
+    }
+
+
+def locate_product_inside(cfg, depth_class_aligned, depth_measure_aligned, package_mask, intrinsics):
+    """Full product_inside result from the height-band locator.
+
+    Drop-in producer for the pipeline's product_inside dict (same keys the
+    legacy detector returned, so the node, heatmap, JSON and grasp-fallback
+    scoring all keep working unchanged). The grasp point is the GRAB blob's
+    centroid; its depth is the median camera distance over that blob.
+    """
+    shape = package_mask.shape
+    result = {
+        "found": False,
+        "center_roi": None,
+        "center_full": None,
+        "center_x_mm": None,
+        "center_y_mm": None,
+        "depth_mm": None,
+        "area_px": 0,
+        "area_ratio_of_package": 0.0,
+        "mask": np.zeros(shape, dtype=np.uint8),
+        "core_mask": np.zeros(shape, dtype=np.uint8),
+        "core_area_px": 0,
+        "core_found": False,
+        "reason": "not_run",
+        "peak_mm": None,
+        "noise_mm": None,
+        "peak_noise_multiple": None,
+        "threshold_mm": None,
+        "rect_w_mm": None,
+        "rect_h_mm": None,
+        "rect_angle_deg": None,
+        "edge_drop_frac": None,
+        "rect_fill": None,
+        "solidity": None,
+        "center_source": None,
+        "candidate_score": None,
+        "edge_sharpness": None,
+    }
+
+    bundle = build_depth_bundle(
+        cfg, depth_class_aligned, depth_measure_aligned, package_mask, intrinsics
+    )
+    if bundle is None:
+        result["reason"] = "not_enough_depth"
+        return result
+
+    result["noise_mm"] = bundle["noise_mm"]
+
+    located = locate_product(cfg, bundle)
+    if located is None:
+        result["reason"] = "no_height_region"
+        return result
+
+    product_mask = located["product_mask"]
+    grab_mask = located["grab_mask"]
+    center_roi = located["grab_center"] or located["product_center"]
+
+    # Grasp depth: median camera distance over the grab blob (fall back to
+    # the product blob when the grab band produced nothing solid).
+    depth_src = grab_mask if grab_mask is not None else product_mask
+    dvals = bundle["depth"][(depth_src == 1) & np.isfinite(bundle["depth"])]
+    if dvals.size < cfg.min_surface_depth_count:
+        dvals = bundle["depth"][(product_mask == 1) & np.isfinite(bundle["depth"])]
+    if dvals.size == 0:
+        result["reason"] = "no_height_region"
+        return result
+    depth_mm = float(np.median(dvals)) + cfg.measurement_depth_offset_mm
+
+    center_full = (
+        int(cfg.roi_x1 + center_roi[0]),
+        int(cfg.roi_y1 + center_roi[1]),
+    )
+    cx_mm, cy_mm = pixel_to_camera_xy_mm(center_full, depth_mm, intrinsics)
+
+    area = int(product_mask.sum())
+    ys, xs = np.where(product_mask == 1)
+    rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+    (_, _), (rect_w, rect_h), rect_angle = rect
+    hull = cv2.convexHull(np.column_stack([xs, ys]).astype(np.float32))
+    mm_per_px = bundle["mm_per_px"] or 0.68
+
+    result.update(
+        {
+            "found": True,
+            "center_roi": (int(center_roi[0]), int(center_roi[1])),
+            "center_full": center_full,
+            "center_x_mm": cx_mm,
+            "center_y_mm": cy_mm,
+            "depth_mm": depth_mm,
+            "area_px": area,
+            "area_ratio_of_package": area / max(int((package_mask > 0).sum()), 1),
+            "mask": product_mask,
+            "core_mask": grab_mask if grab_mask is not None else np.zeros(shape, np.uint8),
+            "core_area_px": int(grab_mask.sum()) if grab_mask is not None else 0,
+            "core_found": grab_mask is not None,
+            "reason": "ok",
+            "peak_mm": float(located["hi_mm"] - located["lo_mm"]),
+            "peak_noise_multiple": float(
+                (located["hi_mm"] - located["lo_mm"]) / bundle["noise_mm"]
+            ),
+            "threshold_mm": float(located["product_thr_mm"]),
+            "rect_w_mm": float(rect_w * mm_per_px),
+            "rect_h_mm": float(rect_h * mm_per_px),
+            "rect_angle_deg": float(rect_angle),
+            "rect_fill": area / max(float(rect_w * rect_h), 1.0),
+            "solidity": area / max(float(cv2.contourArea(hull)), 1.0),
+            "center_source": "height_bands",
+        }
+    )
+    return result

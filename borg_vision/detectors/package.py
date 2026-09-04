@@ -121,7 +121,7 @@ class PackageDetector(BaseDetector):
         # fitted reference plane subtracts the product's own signal and
         # leaves only the central air bubble. Purely a debug artifact.
         try:
-            from ..detection.product_depth import build_depth_bundle
+            from ..detection.package import build_depth_bundle
 
             bundle = build_depth_bundle(
                 cfg,
@@ -144,7 +144,7 @@ class PackageDetector(BaseDetector):
 
                 # Locator overlay: white = product region, black = grab
                 # region, cross = the reported grasp point.
-                from ..detection.product_depth import locate_product
+                from ..detection.package import locate_product
 
                 located = locate_product(cfg, bundle)
                 if located is not None:
