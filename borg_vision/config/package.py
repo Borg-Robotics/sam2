@@ -130,7 +130,14 @@ class PackageConfig(BaseConfig):
     # ----- multi-face merge (angled box showing top + side face) -------
     # Joins a box-rule mask to a touching package-rule mask via their convex
     # hull, for angled boxes where SAM segments each visible face separately.
-    box_multiface_merge_enable: bool = True
+    # OFF 2026-09-07: the station's cameras look straight down, so the
+    # side-face case this exists for does not occur -- and the hull has now
+    # produced the two worst box mis-segmentations on record (the camera_2
+    # tray incident, and 09-06_12-25-04 where it glued the box to carpet,
+    # 290x240 for a 229x221 box that the exact rules got right). detect_box
+    # mode already runs with its copy of this flag False for the same
+    # reason.
+    box_multiface_merge_enable: bool = False
     box_multiface_max_candidates: int = 16
     box_multiface_touch_dilate_px: int = 28
     box_multiface_max_pair_iou: float = 0.20
@@ -370,13 +377,15 @@ class PackageConfig(BaseConfig):
     # there.
     obj_grasp_min_valid_frac: float = 0.10
     obj_grasp_min_depth_levels: int = 3
-    # More than the wire needs: the centre-separation filter thins this list
-    # down to product_inside_grasp_retry_count afterwards.
-    obj_grasp_max_candidates: int = 6
-    # Spacing between kept candidates, in cup radii (1.0 = half a cup: the
-    # next candidate's centre clears the previous cup's rim). Object mode
-    # uses 2.0; the operator wants product fallbacks purely score-ranked.
-    obj_grasp_min_sep_radii: float = 1.0
+    # More than the wire needs: the centre-separation / seam-clearance
+    # filters thin this list down to product_inside_grasp_retry_count
+    # afterwards -- and the box path needs enough survivors to find spots on
+    # BOTH sides of the flap slit, hence the generous count.
+    obj_grasp_max_candidates: int = 12
+    # Spacing between kept candidates, in cup radii. 2.2 = the two retry
+    # cups don't touch each other either (operator 2026-09-04); was 1.0
+    # during the purely-score-ranked era.
+    obj_grasp_min_sep_radii: float = 2.2
     obj_grasp_w_rough: float = 0.35
     obj_grasp_w_tilt: float = 0.15
     obj_grasp_w_centre: float = 0.45
@@ -386,10 +395,16 @@ class PackageConfig(BaseConfig):
     min_center_depth_count: int = 30
     # How many fallbacks to report after the separation filter.
     product_inside_grasp_retry_count: int = 2
-    # A fallback must sit at least this far from the primary point -- not a
-    # spacing preference, just "a different spot at all" (half a cup, so the
-    # retry's centre is off the failed cup's footprint).
-    product_inside_grasp_min_offset_mm: float = 15.0
+    # A fallback must sit at least this far from the primary point.
+    # Operator 2026-09-04: the cup circles must NOT touch -- a full cup
+    # diameter (30) plus clearance, so each retry's footprint is entirely
+    # separate film from the failed pick's.
+    product_inside_grasp_min_offset_mm: float = 32.0
+    # BOX fallbacks keep a bigger floor (operator 2026-09-04): the centre
+    # pick fails when the flap slit through the middle is uneven, so a
+    # useful retry must clear the slit entirely -- a full cup diameter out
+    # lands the whole cup on solid cardboard to one side of it.
+    box_grasp_min_offset_mm: float = 30.0
 
     # ----- NEW product locator (stage 2): height-band segmentation --------
     # Operator-specified 2026-09-03. Two nested segments from the ABSOLUTE

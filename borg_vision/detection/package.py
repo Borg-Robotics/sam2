@@ -3157,35 +3157,49 @@ def run_sam_package_depth_type(
     # it is the same cup on the same station.
     grasp_candidates = []
     if classification["package_type"] == "box" and best["center_roi"] is not None:
-        from .object import score_object_grasp_candidates
-
-        # MEASUREMENT depth, not classification: on camera_1 the class stream
-        # is ~99% blind over cardboard box tops (fine on mailer film), while
-        # the measurement stream reads them at the correct depth -- it is
-        # already what package_face_depth_mm measures the box from.
-        scored = score_object_grasp_candidates(
-            cfg,
-            {"mask": best["mask"]},
-            best["center_roi"],
-            depth_measure_roi,
-            top_face_depth_mm,
-            None,
-            intrinsics,
+        # Operator-specified (2026-09-04): exactly two retries, centre
+        # +-box_grasp_min_offset_mm ALONG THE HORIZONTAL line through the
+        # centre point -- one each side of the flap slit. Deterministic, no
+        # scoring. Each point's depth is measured locally (measurement
+        # stream, the one that sees cardboard) so a tilted box still gets
+        # the right height per point.
+        mm_per_px_box = (
+            float(top_face_depth_mm) / float(intrinsics["fx"])
+            if top_face_depth_mm is not None and intrinsics is not None
+            else 0.68
         )
-        for c in scored:
-            if c.get("offset_mm", 0.0) < cfg.product_inside_grasp_min_offset_mm:
+        off_px = cfg.box_grasp_min_offset_mm / mm_per_px_box
+        cx0, cy0 = best["center_roi"]
+        mh, mw = best["mask"].shape
+
+        # Retries go PERPENDICULAR to the detected seam line, following the
+        # box's own rotation (a square box's rectangle cannot disambiguate
+        # the seam; the RGB edge test along the box axes can).
+        from .box import box_seam_axes
+
+        _, (dx, dy) = box_seam_axes(roi_rgb, best["mask"], (cx0, cy0))
+
+        for sign in (1, -1):
+            gx = int(round(cx0 + sign * off_px * dx))
+            gy = int(round(cy0 + sign * off_px * dy))
+            if not (0 <= gy < mh and 0 <= gx < mw) or best["mask"][gy, gx] == 0:
                 continue
+            from .object import center_depth_mm as _point_depth_mm
+
+            gz, _ = _point_depth_mm(cfg, depth_measure_roi, best["mask"], (gx, gy))
+            if gz is None:
+                gz = top_face_depth_mm
+            point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
+            gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
             grasp_candidates.append(
                 {
-                    "x_mm": c.get("x_mm"),
-                    "y_mm": c.get("y_mm"),
-                    "z_mm": c.get("z_mm"),
-                    "score": c.get("score"),
-                    "point_full": c.get("point_full"),
+                    "x_mm": gx_mm,
+                    "y_mm": gy_mm,
+                    "z_mm": gz,
+                    "score": None,
+                    "point_full": point_full,
                 }
             )
-            if len(grasp_candidates) >= cfg.product_inside_grasp_retry_count:
-                break
 
     heatmap = make_package_depth_heatmap(
         cfg,
@@ -3470,6 +3484,26 @@ def locate_product(cfg, bundle):
         ys, xs = np.where(mask == 1)
         return (int(round(xs.mean())), int(round(ys.mean())))
 
+    # GRASP POINT (operator spec 2026-09-04): not the blob centroid but the
+    # point ON the product closest to the MAILER's centre -- picking near
+    # the mailer's middle leaves the least empty film hanging off the cup
+    # during the carry. The blob is first shrunk by a cup radius so the
+    # chosen point keeps the whole cup on the product region; if the blob is
+    # too small to shrink, the centroid stands.
+    mm_per_px = bundle.get("mm_per_px") or 0.68
+    anchor = grab_mask if grab_mask is not None else product_mask
+    r_px = max(1, int(round((cfg.obj_grasp_cup_diameter_mm / 2.0) / mm_per_px)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r_px * 2 + 1, r_px * 2 + 1))
+    core = cv2.erode(anchor, kernel)
+    if int(core.sum()) == 0:
+        core = anchor
+    mys, mxs = np.where(m)
+    mailer_c = (float(mxs.mean()), float(mys.mean()))
+    cys, cxs = np.where(core == 1)
+    d2 = (cxs - mailer_c[0]) ** 2 + (cys - mailer_c[1]) ** 2
+    k = int(np.argmin(d2))
+    grasp_point = (int(cxs[k]), int(cys[k]))
+
     return {
         "lo_mm": float(lo),
         "hi_mm": float(hi),
@@ -3479,6 +3513,7 @@ def locate_product(cfg, bundle):
         "grab_mask": grab_mask,
         "product_center": _centroid(product_mask),
         "grab_center": _centroid(grab_mask) if grab_mask is not None else None,
+        "grasp_point": grasp_point,
     }
 
 
@@ -3536,6 +3571,10 @@ def locate_product_inside(cfg, depth_class_aligned, depth_measure_aligned, packa
 
     product_mask = located["product_mask"]
     grab_mask = located["grab_mask"]
+    # Operator's pick (settled 2026-09-04 after trying all three variants):
+    # the GRAB blob's centroid -- the centre of the dark-red top band. The
+    # other two variants (product-region centroid, closest-to-mailer-centre
+    # point) remain in `located` for comparison.
     center_roi = located["grab_center"] or located["product_center"]
 
     # Grasp depth: median camera distance over the grab blob (fall back to
