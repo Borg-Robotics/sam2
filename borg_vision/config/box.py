@@ -322,7 +322,10 @@ class BoxConfig(BaseConfig):
     center_depth_radius_px: int = 35
     min_center_depth_count: int = 30
     box_grasp_retry_count: int = 2
-    box_grasp_min_offset_mm: float = 15.0
+    # Full cup diameter (operator 2026-09-04): the centre pick fails on an
+    # uneven flap slit, so each retry sits +-this far along the horizontal
+    # through the centre -- whole cup clear of the slit, one per side.
+    box_grasp_min_offset_mm: float = 30.0
 
     # Set True to print every scored candidate (score, area, rect, colour, bbox)
     # during a detection. That output is what found the 2026-08-28 merge bug --

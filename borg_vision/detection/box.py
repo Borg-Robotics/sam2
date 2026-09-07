@@ -1117,6 +1117,59 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
     return selected
 
 
+def box_seam_axes(roi_img, mask, center_roi):
+    """(seam_unit, perp_unit) for the box's flap seam, at ANY box rotation.
+
+    The seam is a straight edge line (slit shadow / tape edges) through the
+    box centre along one of the box's own axes. The rectangle's angle gives
+    the two candidate axes -- which also handles rotated boxes -- and the
+    edge test picks which axis actually carries the seam, which a SQUARE
+    box's shape alone cannot disambiguate (operator caught this 2026-09-04:
+    a 90-degree rotation put fixed-horizontal retries right on the seam).
+    Retries belong along perp_unit."""
+    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g = cv2.GaussianBlur(gray, (0, 0), 1.5)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+    h_img, w_img = gray.shape
+
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0:
+        return (1.0, 0.0), (0.0, 1.0)
+    (_, _), (rw, rh), rang = cv2.minAreaRect(
+        np.column_stack([xs, ys]).astype(np.float32)
+    )
+    t = np.deg2rad(rang)
+    axis_a = (float(np.cos(t)), float(np.sin(t)))
+    axis_b = (-axis_a[1], axis_a[0])
+
+    cx, cy = float(center_roi[0]), float(center_roi[1])
+    half_len = max(10.0, 0.3 * float(min(rw, rh)))
+    # WIDE swath across the seam, not a thin strip: the seam is often a wide
+    # tape band whose visible edges sit tens of px off the centre line -- a
+    # narrow strip lands inside the blank tape and measures nothing
+    # (camera_2 2026-09-04_13-21-01 flipped a coin exactly that way).
+    half_band = max(8.0, 0.22 * float(min(rw, rh)))
+
+    def energy_along(d):
+        # Mean gradient component ACROSS the swath: a seam band lying along
+        # d has edge lines whose gradients point along n = perp(d).
+        n = (-d[1], d[0])
+        vals = []
+        for s in np.linspace(-half_len, half_len, 41):
+            for w in np.linspace(-half_band, half_band, 15):
+                px = cx + s * d[0] + w * n[0]
+                py = cy + s * d[1] + w * n[1]
+                ix, iy = int(round(px)), int(round(py))
+                if 0 <= iy < h_img and 0 <= ix < w_img:
+                    vals.append(abs(gx[iy, ix] * n[0] + gy[iy, ix] * n[1]))
+        return float(np.mean(vals)) if vals else 0.0
+
+    if energy_along(axis_a) >= energy_along(axis_b):
+        return axis_a, axis_b
+    return axis_b, axis_a
+
+
 def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator, intrinsics):
     """Run SAM2 on the ROI, pick the best cardboard-box mask, and measure its
     face depth + dimensions. Returns a result dict or None when no valid box
@@ -1217,36 +1270,48 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
         intrinsics,
     )
 
-    # Fallback grasp points around the centre -- RETRIES ONLY, the primary
-    # stays the centre. Best-scoring other cup spots on the top face, at
-    # least box_grasp_min_offset_mm from the centre.
+    # Fallback grasp points -- RETRIES ONLY, the primary stays the centre.
+    # Operator-specified (2026-09-04, same rule as the package-mode box
+    # path): exactly two points, centre +-box_grasp_min_offset_mm ALONG THE
+    # HORIZONTAL line through the centre -- one each side of the flap slit.
+    # Deterministic, no scoring; each point's depth is measured locally so a
+    # tilted box gets the right height per point.
     grasp_candidates = []
     if box.get("center_roi") is not None and box_face_depth is not None:
-        from .object import score_object_grasp_candidates
+        from .object import center_depth_mm as _point_depth_mm
 
-        scored = score_object_grasp_candidates(
-            cfg,
-            {"mask": box["mask"]},
-            box["center_roi"],
-            depth_roi_scaled,
-            box_face_depth,
-            None,
-            intrinsics,
+        mm_per_px_box = (
+            float(box_face_depth) / float(intrinsics["fx"])
+            if intrinsics is not None
+            else 0.68
         )
-        for c in scored:
-            if c.get("offset_mm", 0.0) < cfg.box_grasp_min_offset_mm:
+        off_px = cfg.box_grasp_min_offset_mm / mm_per_px_box
+        cx0, cy0 = box["center_roi"]
+        mh, mw = box["mask"].shape
+
+        # Retries go PERPENDICULAR to the detected seam line, following the
+        # box's own rotation.
+        _, (dx, dy) = box_seam_axes(roi_rgb, box["mask"], (cx0, cy0))
+
+        for sign in (1, -1):
+            gx = int(round(cx0 + sign * off_px * dx))
+            gy = int(round(cy0 + sign * off_px * dy))
+            if not (0 <= gy < mh and 0 <= gx < mw) or box["mask"][gy, gx] == 0:
                 continue
+            gz, _ = _point_depth_mm(cfg, depth_roi_scaled, box["mask"], (gx, gy))
+            if gz is None:
+                gz = box_face_depth
+            point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
+            gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
             grasp_candidates.append(
                 {
-                    "x_mm": c.get("x_mm"),
-                    "y_mm": c.get("y_mm"),
-                    "z_mm": c.get("z_mm"),
-                    "score": c.get("score"),
-                    "point_full": c.get("point_full"),
+                    "x_mm": gx_mm,
+                    "y_mm": gy_mm,
+                    "z_mm": gz,
+                    "score": None,
+                    "point_full": point_full,
                 }
             )
-            if len(grasp_candidates) >= cfg.box_grasp_retry_count:
-                break
 
     return {
         "roi_rgb": roi_rgb,
