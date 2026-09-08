@@ -207,8 +207,23 @@ def top_face_depth_and_mask(cfg, depth_roi, mask):
     if vals.size < cfg.object_top_face_min_px:
         return None, 0, None
 
-    near = float(np.percentile(vals, cfg.object_top_face_percentile))
-    cutoff = near + cfg.object_top_face_band_mm
+    # The nearest cluster must hold a REAL share of the surface before it is
+    # believed to be the top face. A glossy highlight can read ~30 mm too
+    # close as a compact patch (camera_2 15-23-26: 9% of the object at
+    # 624 mm, the true top at 660 mm) -- a genuine top face is a large
+    # fraction of the valid pixels (a standing box's measured ~30%+). Step
+    # the anchor percentile deeper until the band captures enough.
+    cutoff = None
+    for pct in (cfg.object_top_face_percentile, 15.0, 30.0, 50.0):
+        near = float(np.percentile(vals, pct))
+        cand = near + cfg.object_top_face_band_mm
+        share = float((vals <= cand).mean())
+        if share >= cfg.object_top_face_min_frac:
+            cutoff = cand
+            break
+    if cutoff is None:
+        cutoff = float(np.percentile(vals, 50.0)) + cfg.object_top_face_band_mm
+
     cluster = vals[vals <= cutoff]
     if cluster.size < cfg.object_top_face_min_px:
         return None, 0, None
@@ -264,6 +279,7 @@ def choose_best_object_mask(cfg, masks, roi_rgb, depth_roi=None):
     roi_cy = h / 2
 
     best = None
+    accepted = []
 
     if cfg.debug_print_masks:
         print()
@@ -371,6 +387,51 @@ def choose_best_object_mask(cfg, masks, roi_rgb, depth_roi=None):
 
         if best is None or candidate["score"] > best["score"]:
             best = candidate
+        accepted.append(candidate)
+
+    # CONTAINER VETO (operator report 2026-09-08, capture 15-13-50): an
+    # opened box shell scored best -- big, centred, square -- with the real
+    # object sitting INSIDE it. A container betrays itself physically: a
+    # smaller candidate is nested within its mask and rises well above the
+    # container's own floor. A genuine object never has raised contents.
+    if depth_roi is not None and len(accepted) > 1:
+        vetoed = set()
+        for i, outer in enumerate(accepted):
+            o_mask = outer["mask"]
+            o_area = int(o_mask.sum())
+            ov = depth_roi[
+                (o_mask == 1)
+                & (depth_roi > cfg.min_valid_depth_mm)
+                & (depth_roi < cfg.max_valid_depth_mm)
+            ]
+            if ov.size < cfg.height_gate_min_depth_count:
+                continue
+            o_floor = float(np.median(ov))
+            for k, inner in enumerate(accepted):
+                if i == k:
+                    continue
+                in_mask = inner["mask"]
+                in_area = int(in_mask.sum())
+                if in_area > 0.6 * o_area:
+                    continue
+                overlap = int((o_mask & in_mask).sum())
+                if overlap < 0.8 * in_area:
+                    continue
+                z_top, n_top, _ = top_face_depth_and_mask(cfg, depth_roi, in_mask)
+                if z_top is None:
+                    continue
+                if (o_floor - z_top) >= cfg.container_veto_min_rise_mm:
+                    vetoed.add(i)
+                    if cfg.debug_print_masks:
+                        print(
+                            f"mask={outer['index']:03d} vetoed as CONTAINER: holds "
+                            f"mask={inner['index']:03d} rising "
+                            f"{o_floor - z_top:.0f} mm above its floor"
+                        )
+                    break
+        survivors = [c for i, c in enumerate(accepted) if i not in vetoed]
+        if survivors:
+            best = max(survivors, key=lambda c: c["score"])
 
     return best
 

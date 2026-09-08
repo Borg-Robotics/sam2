@@ -84,6 +84,11 @@ class ObjectConfig(BaseConfig):
     object_top_face_percentile: float = 5.0
     object_top_face_band_mm: float = 15.0
     object_top_face_min_px: int = 40
+    # The nearest band must capture at least this fraction of the mask's
+    # valid depth before it is trusted as the top face; a compact glossy
+    # highlight reading ~30 mm too close holds only ~9% (2026-09-08), a real
+    # top face 30%+. Below it, the anchor percentile steps deeper.
+    object_top_face_min_frac: float = 0.20
 
     # Object mask gating & scoring.
     min_area_ratio: float = 0.008
@@ -128,7 +133,13 @@ class ObjectConfig(BaseConfig):
     # same depth frame, so there is no fixed plate depth to calibrate and the
     # gate follows plate height or camera changes on its own. The gate is
     # skipped for a candidate when either side lacks valid depth.
-    min_height_above_base_mm: float = 10.0
+    # 5.0 (was 10.0, lowered 2026-09-08): a bagged product's crinkly poly
+    # film reads ~20 mm too DEEP in stereo -- a real bag of product inside a
+    # box measured only 6-8 mm proud of the box floor and the 10 mm gate
+    # rejected it (15-13-50), leaving the box shell to win. The features
+    # this gate exists to reject measure 0-2 mm (plate recess), so 5 keeps
+    # them out while film-wrapped contents pass.
+    min_height_above_base_mm: float = 5.0
     height_gate_ring_px: int = 15
     height_gate_min_depth_count: int = 50
     # The gate may only REJECT when it can see at least this fraction of the
@@ -137,6 +148,12 @@ class ObjectConfig(BaseConfig):
     # misaligned plate pixels stay valid inside the RGB mask, reading base
     # depth -- without this floor that measured a 115 mm white box as 0 mm.
     height_gate_min_valid_frac: float = 0.5
+    # Container veto: a candidate holding a smaller nested candidate whose
+    # top rises at least this far above the outer mask's median depth is a
+    # CONTAINER (opened box shell), not the object -- the contents win
+    # (2026-09-08 15-13-50: box interior beat the bag inside it; the bag's
+    # top sat ~28 mm above the box floor).
+    container_veto_min_rise_mm: float = 18.0
 
     # Scoring weights.
     center_score_weight: float = 1.4
