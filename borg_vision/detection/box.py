@@ -709,7 +709,7 @@ def pair_fragment_compatibility(cfg, first, second):
     }
 
 
-def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
+def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb, depth_roi=None):
     if not cfg.box_merge_split_masks_enable:
         return None
 
@@ -746,6 +746,23 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
 
             if completed_mask is None:
                 continue
+
+            # DEPTH VETO (2026-09-08, same as package mode): everything in a
+            # merged box must sit at ONE height -- a big fraction reading
+            # well below the merge's own face is swallowed plate/tray/table.
+            if depth_roi is not None:
+                dvals = depth_roi[
+                    (completed_mask == 1)
+                    & (depth_roi > cfg.min_valid_depth_mm)
+                    & (depth_roi < cfg.max_valid_depth_mm)
+                ]
+                if dvals.size >= 300:
+                    face = float(np.median(dvals))
+                    off_face = float(
+                        (dvals > face + cfg.box_merge_face_depth_tol_mm).mean()
+                    )
+                    if off_face > cfg.box_merge_max_off_face_frac:
+                        continue
 
             largest_fragment_area = max(first_area, second_area)
             completed_area = int(completed_mask.sum())
@@ -999,7 +1016,7 @@ def build_multiface_cardboard_box_candidate(
     return best
 
 
-def choose_cardboard_box_mask(cfg, masks, roi_rgb):
+def choose_cardboard_box_mask(cfg, masks, roi_rgb, depth_roi=None):
     box_candidates = []
 
     for i, sam_mask in enumerate(masks):
@@ -1045,6 +1062,7 @@ def choose_cardboard_box_mask(cfg, masks, roi_rgb):
         cfg,
         box_candidates,
         roi_rgb,
+        depth_roi=depth_roi,
     )
 
     selected = best_single
@@ -1183,7 +1201,7 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
     with torch.inference_mode():
         masks = mask_generator.generate(roi_rgb)
 
-    box = choose_cardboard_box_mask(cfg, masks, roi_rgb)
+    box = choose_cardboard_box_mask(cfg, masks, roi_rgb, depth_roi=depth_roi_scaled)
 
     if box is None:
         return None
@@ -1289,29 +1307,34 @@ def run_sam2_cardboard_box(cfg, frame_bgr, depth_measure_aligned, mask_generator
         cx0, cy0 = box["center_roi"]
         mh, mw = box["mask"].shape
 
-        # Retries go PERPENDICULAR to the detected seam line, following the
-        # box's own rotation.
-        _, (dx, dy) = box_seam_axes(roi_rgb, box["mask"], (cx0, cy0))
+        # One retry per box axis (operator 2026-09-08): retry 1 goes ACROSS
+        # the detected seam (the direction the line says clears the split),
+        # retry 2 goes ALONG the seam axis -- one roughly horizontal, one
+        # roughly vertical on a squared-up box. Each tries the + side first
+        # and flips to the - side if that point is off the box.
+        seam_axis, perp_axis = box_seam_axes(roi_rgb, box["mask"], (cx0, cy0))
 
-        for sign in (1, -1):
-            gx = int(round(cx0 + sign * off_px * dx))
-            gy = int(round(cy0 + sign * off_px * dy))
-            if not (0 <= gy < mh and 0 <= gx < mw) or box["mask"][gy, gx] == 0:
-                continue
-            gz, _ = _point_depth_mm(cfg, depth_roi_scaled, box["mask"], (gx, gy))
-            if gz is None:
-                gz = box_face_depth
-            point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
-            gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
-            grasp_candidates.append(
-                {
-                    "x_mm": gx_mm,
-                    "y_mm": gy_mm,
-                    "z_mm": gz,
-                    "score": None,
-                    "point_full": point_full,
-                }
-            )
+        for dx, dy in (perp_axis, seam_axis):
+            for sign in (1, -1):
+                gx = int(round(cx0 + sign * off_px * dx))
+                gy = int(round(cy0 + sign * off_px * dy))
+                if not (0 <= gy < mh and 0 <= gx < mw) or box["mask"][gy, gx] == 0:
+                    continue
+                gz, _ = _point_depth_mm(cfg, depth_roi_scaled, box["mask"], (gx, gy))
+                if gz is None:
+                    gz = box_face_depth
+                point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
+                gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
+                grasp_candidates.append(
+                    {
+                        "x_mm": gx_mm,
+                        "y_mm": gy_mm,
+                        "z_mm": gz,
+                        "score": None,
+                        "point_full": point_full,
+                    }
+                )
+                break
 
     return {
         "roi_rgb": roi_rgb,

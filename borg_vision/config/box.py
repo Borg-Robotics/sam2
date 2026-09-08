@@ -321,6 +321,12 @@ class BoxConfig(BaseConfig):
     obj_grasp_w_edge: float = 0.05
     center_depth_radius_px: int = 35
     min_center_depth_count: int = 30
+    # Depth veto on merged rectangles (2026-09-08, mirrors PackageConfig):
+    # >max_off_face_frac of the completed rect reading >tol below its own
+    # face median = the merge swallowed the plate/table -> rejected.
+    box_merge_face_depth_tol_mm: float = 30.0
+    box_merge_max_off_face_frac: float = 0.10
+
     box_grasp_retry_count: int = 2
     # Full cup diameter (operator 2026-09-04): the centre pick fails on an
     # uneven flap slit, so each retry sits +-this far along the horizontal
