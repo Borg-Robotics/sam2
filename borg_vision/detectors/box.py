@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from ..config import BoxConfig
 from ..detection.box import run_sam2_cardboard_box
@@ -88,6 +89,15 @@ class BoxDetector(BaseDetector):
         cv2.imwrite(str(raw_path), result.frames.rgb)
         cv2.imwrite(str(result_path), result_bgr)
         save_binary_mask(mask_path, result.raw["box"]["mask"])
+
+        # Measurement depth, unquantised (added 2026-09-08): box failures
+        # could not be replayed offline without it -- every depth-dependent
+        # stage (face depth, extent refine, merge depth-veto) was untestable
+        # against a saved capture.
+        depth_path = save_dir / artifact_name(
+            "depth_measure_aligned", "npy", timestamp, organized
+        )
+        np.save(str(depth_path), result.frames.depth_measure_aligned)
 
         with open(json_path, "w") as f:
             json.dump(make_json_result(cfg, result.raw, timestamp), f, indent=2)

@@ -163,7 +163,14 @@ class BoxConfig(BaseConfig):
     # depth_align_* above): measure a box's edges in raw_rgb.jpg and in
     # depth_roi_mm.png and confirm they coincide. Until they do, any depth-space
     # mask repair inherits the same offset.
-    box_face_extent_refine_enable: bool = False
+    # ON 2026-09-08: a tape-banded top split the mask in half again
+    # (camera_2 14-09-02, 209x129 reported for a ~215x215 box; the bad size
+    # halted the BT) and this refine is the designed cure. The alignment
+    # concern above was re-measured offline the same day: ~18 px x-offset on
+    # the one clean sample -- an ~11 mm worst-case edge bias, far smaller
+    # than the 86 mm failure it prevents, and the growth/kept guards below
+    # bound the damage. Full alignment calibration remains a follow-up.
+    box_face_extent_refine_enable: bool = True
     box_face_extent_tolerance_mm: float = 6.0
     # 0.65, NOT a high value. On the face this fraction sits at 0.77-0.95 --
     # it wobbles, because the mask's own rows include some off-face pixels --
