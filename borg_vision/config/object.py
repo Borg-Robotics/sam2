@@ -25,7 +25,8 @@ class ObjectConfig(BaseConfig):
     # 695.0 from BaseConfig, but the tray this rig measures against sits at
     # 705.0 (measured median over the surface, and what box/polymailer/
     # clear_bag already use); the old value under-reported every height by 10mm.
-    base_depth_mm: float = 705.0
+    # 700.0 (was 705.0, operator 2026-09-08): heights read ~5 mm large.
+    base_depth_mm: float = 700.0
 
     # Locked ROI (from the polymailer/object script).
     # SAM2 prompt grid, overriding the base 24. Measured 2026-08-24 on 10 saved
