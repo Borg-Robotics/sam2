@@ -789,7 +789,7 @@ def build_multiface_cardboard_box_candidate(
     return best
 
 
-def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
+def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb, depth_roi=None):
     if not cfg.box_merge_split_masks_enable:
         return None
 
@@ -902,6 +902,26 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
             if completed_mask is None:
                 continue
 
+            # DEPTH VETO (operator 2026-09-08): everything inside a merged
+            # box must sit at ONE height. A merge that swallowed carpet or
+            # table reads a big fraction of its area well BELOW its own face
+            # (bad merge 11-44-51: 21% of pixels >30 mm below the face; a
+            # genuine box: 2%). Colour could not catch this -- the box's
+            # good mean hid the carpet band.
+            if depth_roi is not None:
+                dvals = depth_roi[
+                    (completed_mask == 1)
+                    & (depth_roi > cfg.min_valid_depth_mm)
+                    & (depth_roi < cfg.max_valid_depth_mm)
+                ]
+                if dvals.size >= 300:
+                    face = float(np.median(dvals))
+                    off_face = float(
+                        (dvals > face + cfg.box_merge_face_depth_tol_mm).mean()
+                    )
+                    if off_face > cfg.box_merge_max_off_face_frac:
+                        continue
+
             largest_fragment_area = max(first_area, second_area)
             completed_area = int(completed_mask.sum())
             area_growth = completed_area / max(largest_fragment_area, 1)
@@ -977,7 +997,7 @@ def build_merged_cardboard_box_candidate(cfg, box_candidates, roi_rgb):
     return best_merged
 
 
-def choose_best_package_mask_from_package_roi(cfg, masks, roi_rgb):
+def choose_best_package_mask_from_package_roi(cfg, masks, roi_rgb, depth_roi=None):
     best_package = None
     best_box = None
     package_candidates = []
@@ -1060,6 +1080,7 @@ def choose_best_package_mask_from_package_roi(cfg, masks, roi_rgb):
         cfg,
         box_candidates,
         roi_rgb,
+        depth_roi=depth_roi,
     )
 
     if merged_box is not None:
@@ -1417,7 +1438,7 @@ def map_dedicated_box_candidate_to_package_roi(cfg, box_candidate):
     return candidate
 
 
-def choose_best_package_mask(cfg, masks, roi_rgb, dedicated_box_candidate=None):
+def choose_best_package_mask(cfg, masks, roi_rgb, dedicated_box_candidate=None, depth_roi=None):
     """
     Keep the complete existing package-ROI selection path, then compare it
     against the exact box-script candidate made from the same package ROI masks.
@@ -1426,6 +1447,7 @@ def choose_best_package_mask(cfg, masks, roi_rgb, dedicated_box_candidate=None):
         cfg,
         masks,
         roi_rgb,
+        depth_roi=depth_roi,
     )
 
     if dedicated_box_candidate is None:
@@ -3011,6 +3033,7 @@ def run_sam_package_depth_type(
         masks,
         roi_rgb,
         dedicated_box_candidate,
+        depth_roi=depth_measure_roi,
     )
 
     if best is None:
@@ -3172,34 +3195,37 @@ def run_sam_package_depth_type(
         cx0, cy0 = best["center_roi"]
         mh, mw = best["mask"].shape
 
-        # Retries go PERPENDICULAR to the detected seam line, following the
-        # box's own rotation (a square box's rectangle cannot disambiguate
-        # the seam; the RGB edge test along the box axes can).
+        # One retry per box axis (operator 2026-09-08): retry 1 goes ACROSS
+        # the seam -- OFF the split, the direction the detected line says
+        # clears it -- and retry 2 goes ALONG the seam axis (on the seam
+        # line, 30 mm out, in case the slit is only bad near the middle).
+        # Each tries the + side first and flips if that point is off the box.
         from .box import box_seam_axes
+        from .object import center_depth_mm as _point_depth_mm
 
-        _, (dx, dy) = box_seam_axes(roi_rgb, best["mask"], (cx0, cy0))
+        seam_axis, perp_axis = box_seam_axes(roi_rgb, best["mask"], (cx0, cy0))
 
-        for sign in (1, -1):
-            gx = int(round(cx0 + sign * off_px * dx))
-            gy = int(round(cy0 + sign * off_px * dy))
-            if not (0 <= gy < mh and 0 <= gx < mw) or best["mask"][gy, gx] == 0:
-                continue
-            from .object import center_depth_mm as _point_depth_mm
-
-            gz, _ = _point_depth_mm(cfg, depth_measure_roi, best["mask"], (gx, gy))
-            if gz is None:
-                gz = top_face_depth_mm
-            point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
-            gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
-            grasp_candidates.append(
-                {
-                    "x_mm": gx_mm,
-                    "y_mm": gy_mm,
-                    "z_mm": gz,
-                    "score": None,
-                    "point_full": point_full,
-                }
-            )
+        for dx, dy in (perp_axis, seam_axis):
+            for sign in (1, -1):
+                gx = int(round(cx0 + sign * off_px * dx))
+                gy = int(round(cy0 + sign * off_px * dy))
+                if not (0 <= gy < mh and 0 <= gx < mw) or best["mask"][gy, gx] == 0:
+                    continue
+                gz, _ = _point_depth_mm(cfg, depth_measure_roi, best["mask"], (gx, gy))
+                if gz is None:
+                    gz = top_face_depth_mm
+                point_full = (cfg.roi_x1 + gx, cfg.roi_y1 + gy)
+                gx_mm, gy_mm = pixel_to_camera_xy_mm(point_full, gz, intrinsics)
+                grasp_candidates.append(
+                    {
+                        "x_mm": gx_mm,
+                        "y_mm": gy_mm,
+                        "z_mm": gz,
+                        "score": None,
+                        "point_full": point_full,
+                    }
+                )
+                break
 
     heatmap = make_package_depth_heatmap(
         cfg,

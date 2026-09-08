@@ -116,6 +116,13 @@ class PackageConfig(BaseConfig):
     # nothing on genuine splits.
     box_merge_min_fragment_color_score: float = 0.60
     box_merge_min_fragment_rectangularity: float = 0.70
+    # DEPTH VETO on the completed rectangle (operator 2026-09-08: "depth
+    # should play a big part"): everything inside a merged box must sit at
+    # one height. Pixels reading more than the tolerance BELOW the merge's
+    # own face are carpet/table swallowed by the rectangle completion; a
+    # genuine box measures ~2% off-face, the 11-44-51 bad merge 21%.
+    box_merge_face_depth_tol_mm: float = 30.0
+    box_merge_max_off_face_frac: float = 0.10
 
     # ----- rotated split-mask merge (angled boxes split along a seam) ---
     # Fallback pairing rule for build_merged_cardboard_box_candidate: when a
