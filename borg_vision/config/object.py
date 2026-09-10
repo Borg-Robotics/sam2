@@ -90,6 +90,22 @@ class ObjectConfig(BaseConfig):
     # highlight reading ~30 mm too close holds only ~9% (2026-09-08), a real
     # top face 30%+. Below it, the anchor percentile steps deeper.
     object_top_face_min_frac: float = 0.20
+    # Picks are confined to the top region only when the REST of the mask
+    # carries at least this fraction of valid depth -- i.e. it is another
+    # surface (a standing box's front face). Below it the rest is blank
+    # stereo on a glossy flat top, and the picks keep the whole mask
+    # (2026-09-10 16-00-10: 54% top region, no cup fit).
+    object_top_face_rest_valid_frac: float = 0.5
+    # ...AND that rest must read at least this much deeper (median) than the
+    # top face. A standing box's front face drops tens of mm; speckle on a
+    # flat glossy top drops ~7 mm (16-00-10) and must not shrink the picks.
+    object_top_face_rest_min_drop_mm: float = 15.0
+    # When the top surface covers at least this share of the mask, the mask
+    # is TRIMMED to it (size/centre/angle recomputed) -- cuts attached
+    # neighbours at other depths, e.g. a skirt of box floor stuck to a flat
+    # product (2026-09-09 13-32-37). A standing object (top face ~30%)
+    # stays whole.
+    object_top_face_trim_frac: float = 0.55
 
     # Object mask gating & scoring.
     min_area_ratio: float = 0.008
@@ -155,6 +171,50 @@ class ObjectConfig(BaseConfig):
     # (2026-09-08 15-13-50: box interior beat the bag inside it; the bag's
     # top sat ~28 mm above the box floor).
     container_veto_min_rise_mm: float = 18.0
+    # Container RESCUE (no second SAM mask needed, 2026-09-10 16-20-05): the
+    # chosen mask is a container when its top region holds at most this
+    # fraction of it, the rest lies within container_floor_tolerance_mm of
+    # base_depth (floor level) and the top rises container_veto_min_rise_mm
+    # above that floor; SAM is then re-prompted on the raised island.
+    container_top_max_frac: float = 0.5
+    container_floor_tolerance_mm: float = 15.0
+
+    # --- inside-box wall clearance (DetectObject.inside_box goal flag) -----
+    # When the goal sets inside_box, everything the depth sees standing
+    # taller than the object's top by wall_min_rise counts as a WALL, and
+    # the grasp point + retries must keep wall_clearance from all of it so
+    # the end-effector body fits. Clearance = gripper body radius + margin;
+    # MEASURE the gripper -- this default is a placeholder.
+    object_inside_box: bool = False        # set per-goal by the node
+    object_wall_min_rise_mm: float = 10.0
+    # GRIPPER BODY, exactly as box_mover's wall fit reads it off the robot
+    # model (vacuum_gripper_base_link collision box in the cup frame):
+    # x from -35.5 to +32.5 mm, y +-46 mm about the cup. The robot tries the
+    # cup at the object's yaw and its three quarter turns and needs every
+    # corner of that box pick.wall_fit_margin clear of every wall panel;
+    # the object mode runs the SAME test per pixel (operator 2026-09-10:
+    # the points we output must never fail the inside-box pick), so these
+    # numbers must track box_mover. If the gripper URDF changes, change
+    # them here too.
+    object_effector_x_min_mm: float = -35.5
+    object_effector_x_max_mm: float = 32.5
+    object_effector_y_half_mm: float = 46.0
+    # = box_mover pick.wall_fit_margin (0.002 m).
+    object_wall_margin_mm: float = 2.0
+    # Extra room on top of the robot's margin, because the robot judges
+    # against wall panels built from detect_box's measurement BEFORE the cut
+    # (outer size, 3 mm panels) while this mode fits its rectangle to the
+    # opened box in the current image. Covers the two disagreeing by this
+    # much; raise it if an inside-box pick is ever refused on a point this
+    # mode reported.
+    object_wall_scene_allowance_mm: float = 4.0
+    # The detected box rectangle fits the box RIM, ~a few mm outside the
+    # real inner wall; clearances are measured to a boundary this far inside
+    # the drawn red line (operator 2026-09-10).
+    object_wall_extra_inset_mm: float = 3.0
+    # Scalar clearance for the DEPTH-based fallback only (no rectangle, so
+    # no direction): the body's long half + margin + allowance.
+    object_wall_clearance_mm: float = 52.0
 
     # Scoring weights.
     center_score_weight: float = 1.4

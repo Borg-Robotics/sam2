@@ -66,6 +66,27 @@ def draw_result(cfg, frame_bgr, depth_aligned, result):
         + 0.50 * np.array([0, 255, 0])
     ).astype(np.uint8)
 
+    # inside_box overlay: the RED RECTANGLE is the detected box (its inner
+    # walls); grasp points keep object_wall_clearance_mm inside it. The
+    # tinted fallback appears only when no box rectangle could be found.
+    box_quad = result.get("box_quad")
+    if box_quad is not None:
+        cv2.polylines(roi_rgb, [box_quad], True, (255, 0, 0), 3)
+    # YELLOW outline: where the cup may land so that the gripper body fits
+    # inside the walls at some quarter turn (box_mover's own test). Every
+    # grasp point and retry must be inside it.
+    feasible = result.get("wall_feasible")
+    if feasible is not None and int(feasible.sum()) > 0:
+        cnts, _ = cv2.findContours(
+            np.ascontiguousarray(feasible.astype(np.uint8)),
+            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(roi_rgb, cnts, -1, (255, 255, 0), 1)
+    wall_mask = result.get("wall_mask")
+    if wall_mask is not None and int(wall_mask.sum()) > 0:
+        roi_rgb[wall_mask == 1] = (
+            0.5 * roi_rgb[wall_mask == 1] + 0.5 * np.array([255, 0, 0])
+        ).astype(np.uint8)
+
     result_rgb[cfg.roi_y1:cfg.roi_y2, cfg.roi_x1:cfg.roi_x2] = roi_rgb
 
     cv2.rectangle(result_rgb, (cfg.roi_x1, cfg.roi_y1), (cfg.roi_x2, cfg.roi_y2), (0, 255, 255), 3)

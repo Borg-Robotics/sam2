@@ -436,6 +436,114 @@ def choose_best_object_mask(cfg, masks, roi_rgb, depth_roi=None):
     return best
 
 
+def top_area_min_px_for_solid(cfg, top_region):
+    """The hull must not be a degenerate sliver: at least the region itself."""
+    return max(cfg.object_top_face_min_px, int(top_region.sum()))
+
+
+def rescue_object_from_container(cfg, obj, roi_rgb, depth_roi, mask_generator):
+    """See run_sam2_object_segmentation: returns a replacement candidate dict
+    when `obj` is a box interior with a raised product inside, else None."""
+    mask = obj["mask"].astype(np.uint8)
+    area = int(mask.sum())
+    if area == 0:
+        return None
+    distance_mm, _, top_mask = top_face_depth_and_mask(cfg, depth_roi, mask)
+    if distance_mm is None or top_mask is None:
+        return None
+    top_region = largest_component(
+        cv2.morphologyEx(top_mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    )
+    if top_region is None:
+        return None
+    top_area = int(top_region.sum())
+    if top_area < cfg.object_top_face_min_px or top_area > cfg.container_top_max_frac * area:
+        return None
+    rest = (mask > 0) & (top_region == 0)
+    rd = depth_roi[rest]
+    rv = (rd > cfg.min_valid_depth_mm) & (rd < cfg.max_valid_depth_mm)
+    if rv.sum() < cfg.height_gate_min_depth_count:
+        return None
+    floor = float(np.median(rd[rv]))
+    if floor < cfg.base_depth_mm - cfg.container_floor_tolerance_mm:
+        return None                       # the rest is not at floor level
+    if floor - float(distance_mm) < cfg.container_veto_min_rise_mm:
+        return None                       # nothing stands on that floor
+    island_center = get_mask_center(top_region)
+    if island_center is None:
+        return None
+
+    # Point-prompt SAM on the island. multimask gives three nested guesses;
+    # keep the one that overlaps the island best and is clearly smaller than
+    # the container.
+    chosen = None
+    try:
+        predictor = getattr(mask_generator, "predictor", None)
+        if predictor is not None:
+            with torch.inference_mode():
+                predictor.set_image(roi_rgb)
+                pm, ps, _ = predictor.predict(
+                    point_coords=np.array([[island_center[0], island_center[1]]], dtype=np.float32),
+                    point_labels=np.array([1], dtype=np.int32),
+                    multimask_output=True,
+                )
+            best_iou = 0.0
+            for k in range(pm.shape[0]):
+                cand = np.ascontiguousarray(pm[k].astype(np.uint8))
+                ca = int(cand.sum())
+                if ca == 0 or ca > 0.6 * area:
+                    continue
+                inter = int(((cand > 0) & (top_region > 0)).sum())
+                iou = inter / float(ca + top_area - inter)
+                if iou > best_iou:
+                    best_iou, chosen = iou, cand
+    except Exception as exc:  # the rescue must never take the detection down
+        print(f"[object] container rescue: SAM prompt failed ({exc}); using the depth island")
+        chosen = None
+    if chosen is None:
+        chosen = top_region.astype(np.uint8)
+
+    if cfg.debug_print_masks:
+        print(
+            f"mask={obj['index']:03d} is a CONTAINER (floor {floor:.0f} mm, island "
+            f"{distance_mm:.0f} mm, {top_area}/{area} px): re-prompted SAM at "
+            f"{island_center}"
+        )
+    return candidate_from_mask(cfg, chosen, roi_rgb, obj, float(floor - distance_mm),
+                               tag="rescued_from_container")
+
+
+def candidate_from_mask(cfg, raw_mask, roi_rgb, base_obj, height_mm, tag):
+    """A candidate dict (as choose_best_object_mask builds them) for a mask
+    produced outside the automatic pass; None when the mask is unusable."""
+    cleaned = clean_mask(cfg, raw_mask.astype(np.uint8))
+    if int(cleaned.sum()) == 0:
+        cleaned = raw_mask.astype(np.uint8)
+    x, y, bw, bh = cv2.boundingRect(cleaned)
+    if bw <= 0 or bh <= 0:
+        return None
+    center = get_mask_center(cleaned)
+    if center is None:
+        return None
+    c_area = int(cleaned.sum())
+    roi_area = roi_rgb.shape[0] * roi_rgb.shape[1]
+    return {
+        "index": -1,
+        "score": float(base_obj["score"]),
+        "mask": cleaned,
+        "bbox": (x, y, bw, bh),
+        "center_roi": center,
+        "area_ratio": float(c_area / max(roi_area, 1)),
+        "rectangularity": float(c_area / max(bw * bh, 1)),
+        "aspect_ratio": float(max(bw / max(bh, 1), bh / max(bw, 1))),
+        "center_score": 0.0,
+        "area_score": 0.0,
+        "sam_iou": 0.0,
+        "sam_stability": 0.0,
+        "height_above_base_mm": height_mm,
+        tag: True,
+    }
+
 
 def score_object_grasp_candidates(
     cfg,
@@ -445,6 +553,8 @@ def score_object_grasp_candidates(
     distance_mm,
     dimensions,
     intrinsics,
+    keepout_clear=None,
+    keepout_min_px=0.0,
 ):
     """Rank suction-cup grasp points on a detected object, centred on its centroid.
 
@@ -500,6 +610,8 @@ def score_object_grasp_candidates(
         for x in range(radius_px, w - radius_px, step):
             if d_edge[y, x] < radius_px + margin_px:
                 continue                      # cup would overhang the object
+            if keepout_clear is not None and keepout_clear[y, x] < keepout_min_px:
+                continue                      # end effector would hit a wall
             offset = float(np.hypot(x - nx, y - ny))
             if offset > max_offset_px:
                 continue
@@ -592,6 +704,20 @@ def run_sam2_object_segmentation(
     if obj is None:
         return None
 
+    # CONTAINER RESCUE (2026-09-10 16-20-05): SAM's automatic masks vary run
+    # to run, and when it offers no usable mask of the product the box
+    # interior wins and the container veto has nothing to veto with. The
+    # depth still tells: most of a container mask lies at FLOOR level
+    # (within container_floor_tolerance_mm of base_depth) with a raised
+    # island -- the product -- standing container_veto_min_rise_mm above
+    # it. A standing object's front face is a ramp well above the plate, a
+    # flat object's whole mask is raised: neither matches. On a match SAM is
+    # re-prompted with a point on the island, which is what a person would
+    # click, and the mask closest to the island replaces the container.
+    rescued = rescue_object_from_container(cfg, obj, roi_rgb, depth_roi, mask_generator)
+    if rescued is not None:
+        obj = rescued
+
     center_full = (
         cfg.roi_x1 + obj["center_roi"][0],
         cfg.roi_y1 + obj["center_roi"][1],
@@ -638,10 +764,194 @@ def run_sam2_object_segmentation(
         )
         top_region = largest_component(top_region)
         if top_region is not None and int(top_region.sum()) >= cfg.object_top_face_min_px:
+            # Shrink to the top region ONLY when the rest of the mask is a
+            # genuinely different surface -- valid depth reading deeper, a
+            # standing box's front face. When the rest is simply BLANK
+            # stereo (a glossy top, 16-00-10: the region held 54% of a flat
+            # object and no cup fit inside its ragged edge) the whole mask
+            # IS the top face and the picks keep the full footprint.
+            # "Different surface" = the rest reads materially DEEPER than the
+            # top face (a front face runs down toward the plate); noisy
+            # stereo on a flat glossy top (16-00-10: 87% valid, spread over
+            # 28 mm, rest median only 7 mm deeper) is not.
+            rest = (obj["mask"] > 0) & (top_region == 0)
+            rest_depth = depth_roi[rest]
+            rest_valid = (rest_depth > cfg.min_valid_depth_mm) & (rest_depth < cfg.max_valid_depth_mm)
+            rest_valid_frac = float(rest_valid.mean()) if rest_depth.size else 0.0
+            rest_drop_mm = (
+                float(np.median(rest_depth[rest_valid])) - float(distance_mm)
+                if rest_valid.any() else 0.0
+            )
+            rest_is_surface = (
+                rest_valid_frac >= cfg.object_top_face_rest_valid_frac
+                and rest_drop_mm >= cfg.object_top_face_rest_min_drop_mm
+            )
             top_center = get_mask_center(top_region)
-            if top_center is not None:
-                grasp_mask = top_region
-                grasp_anchor = top_center
+            if top_center is not None and rest_is_surface:
+                # The depth-derived region is RAGGED (speckle holes, torn
+                # edges) and as a cup playing field it starved the picks
+                # (16-20-05: 5 px of zone on a 180 mm pouch). Use its convex
+                # hull clipped to the object outline instead: the top face's
+                # footprint with SAM's clean edge. A standing box's top face
+                # is convex anyway; the front face stays outside the hull.
+                pts = np.column_stack(np.where(top_region > 0)[::-1]).astype(np.int32)
+                hull = cv2.convexHull(pts)
+                solid = np.zeros(top_region.shape, dtype=np.uint8)
+                cv2.fillConvexPoly(solid, hull, 1)
+                solid = (solid > 0) & (obj["mask"] > 0)
+                solid = largest_component(solid.astype(np.uint8))
+                if solid is not None and int(solid.sum()) >= top_area_min_px_for_solid(cfg, top_region):
+                    solid_center = get_mask_center(solid)
+                    if solid_center is not None:
+                        grasp_mask = solid
+                        grasp_anchor = solid_center
+                    else:
+                        grasp_mask = top_region
+                        grasp_anchor = top_center
+                else:
+                    grasp_mask = top_region
+                    grasp_anchor = top_center
+
+    # INSIDE-BOX wall clearance (DetectObject.inside_box): anything the
+    # depth sees standing taller than the object's top is a wall, and every
+    # grasp point must keep object_wall_clearance_mm from all of it so the
+    # end-effector body fits down beside the object.
+    wall_clear = None
+    wall_clear_px = 0.0
+    wall_mask_out = None
+    wall_feasible_out = None
+    box_quad = None
+    if cfg.object_inside_box and distance_mm is not None and intrinsics is not None:
+        # BOX RECTANGLE keep-out (operator spec 2026-09-10): find the SAM
+        # mask that CONTAINS the object -- the box interior -- and fit a
+        # rectangle to it. That rectangle is the wall line; the grasp point
+        # and retries must stay object_wall_clearance_mm inside it. Clean
+        # geometry instead of speckly depth walls.
+        obj_mask = obj["mask"].astype(bool)
+        obj_area = int(obj_mask.sum())
+        roi_area = obj_mask.shape[0] * obj_mask.shape[1]
+        container = None
+        container_area = None
+        for m in masks:
+            seg = np.ascontiguousarray(m["segmentation"].astype(np.uint8))
+            # Fill holes first: SAM's box-interior mask has a HOLE where the
+            # object sits, so the raw mask never "contains" the object --
+            # the filled outline does.
+            cnts_c, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts_c:
+                continue
+            filled = np.zeros(seg.shape, dtype=np.uint8)
+            cv2.drawContours(filled, cnts_c, -1, 1, thickness=-1)
+            a = int(filled.sum())
+            if a < 2 * obj_area or a > 0.6 * roi_area:
+                continue
+            inter = int((filled.astype(bool) & obj_mask).sum())
+            if inter < 0.85 * obj_area:
+                continue
+            # WALLNESS test: a real box rectangle has walls just OUTSIDE
+            # its border -- depth in that ring reads taller than the object
+            # or unknown (thin crowns). A plate-sized region also "contains"
+            # the object but its ring is flat table. Measured 2026-09-10:
+            # box rings 0.36-0.38, plate rings 0.09-0.18; threshold 0.27
+            # sits between. The ring is sampled OUTSIDE the rectangle --
+            # sampling on the line itself dilutes with floor pixels.
+            r_ = cv2.minAreaRect(
+                np.column_stack(np.where(filled > 0)[::-1]).astype(np.float32)
+            )
+            (rcx_, rcy_), (rw_, rh_), ra_ = r_
+            outer = cv2.boxPoints(((rcx_, rcy_), (rw_ + 28, rh_ + 28), ra_)).astype(np.int32)
+            inner = cv2.boxPoints(r_).astype(np.int32)
+            ring = np.zeros_like(filled)
+            cv2.fillPoly(ring, [outer], 1)
+            cv2.fillPoly(ring, [inner], 0)
+            bd = depth_roi[ring > 0]
+            if bd.size < 200:
+                continue
+            b_valid = (bd > cfg.min_valid_depth_mm) & (bd < cfg.max_valid_depth_mm)
+            b_tall = b_valid & (bd < float(distance_mm) - cfg.object_wall_min_rise_mm)
+            wallness = float((b_tall | ~b_valid).mean())
+            if wallness < 0.27:
+                continue
+            if container_area is None or wallness > container_area[0] or (
+                wallness == container_area[0] and a < container_area[1]
+            ):
+                container = filled
+                container_area = (wallness, a)
+        if container is not None:
+            # Rim rectangle from the container mask. It sits a few mm
+            # outside the true inner wall, so the clearance math below
+            # subtracts object_wall_extra_inset_mm (operator 2026-09-10:
+            # "keep the red wall, add ~3 mm"); the drawn red line stays at
+            # the rim for eyeballing.
+            cys, cxs = np.where(container > 0)
+            rect = cv2.minAreaRect(np.column_stack([cxs, cys]).astype(np.float32))
+            box_quad = cv2.boxPoints(rect).astype(np.int32)
+            # SAME TEST AS THE ROBOT (box_mover wall_fit, operator 2026-09-10:
+            # "the grasp points we output must never fail the inside-box
+            # pick"). box_mover tries the cup at the object's yaw and its
+            # three quarter turns, swings the gripper body's collision box
+            # (x [x_min, x_max], y +-y_half about the cup, from the robot
+            # model) around each, and needs every corner wall_fit_margin
+            # clear of every wall panel. Reproduced here per pixel: the
+            # object's long axis relative to the box rectangle gives the
+            # lattice, the body corners are projected on the rectangle's
+            # axes, and a pixel is feasible when SOME quarter turn keeps
+            # all four corners margin + allowance inside the inset rim.
+            # The allowance covers the planning-scene walls (measured by
+            # detect_box before the cut) disagreeing with this rectangle
+            # by a few mm. Mirror-safe: the +-x asymmetry is covered by
+            # the half-turn candidate, y is symmetric.
+            (qcx, qcy), (qw, qh), qang = rect
+            t = np.deg2rad(qang)
+            ux, uy = np.cos(t), np.sin(t)
+            mm_pp_q = float(distance_mm) / float(max(intrinsics["fx"], intrinsics["fy"]))
+            gy_, gx_ = np.mgrid[0:obj["mask"].shape[0], 0:obj["mask"].shape[1]]
+            pu = ((gx_ - qcx) * ux + (gy_ - qcy) * uy) * mm_pp_q
+            pv = (-(gx_ - qcx) * uy + (gy_ - qcy) * ux) * mm_pp_q
+            half_u = qw / 2.0 * mm_pp_q - cfg.object_wall_extra_inset_mm
+            half_v = qh / 2.0 * mm_pp_q - cfg.object_wall_extra_inset_mm
+            obj_angle = float(angle_deg) if angle_deg is not None else 0.0
+            phi0 = np.deg2rad(obj_angle - qang)
+            corners = [
+                (x_, y_)
+                for x_ in (cfg.object_effector_x_min_mm, cfg.object_effector_x_max_mm)
+                for y_ in (-cfg.object_effector_y_half_mm, cfg.object_effector_y_half_mm)
+            ]
+            best_clear = np.full(pu.shape, -1.0e6, dtype=np.float32)
+            for k in range(4):
+                phi = phi0 + k * np.pi / 2.0
+                c_, s_ = np.cos(phi), np.sin(phi)
+                cu = [x_ * c_ - y_ * s_ for x_, y_ in corners]
+                cv_ = [x_ * s_ + y_ * c_ for x_, y_ in corners]
+                clear_k = np.minimum.reduce([
+                    half_u - (pu + max(cu)),
+                    (pu + min(cu)) + half_u,
+                    half_v - (pv + max(cv_)),
+                    (pv + min(cv_)) + half_v,
+                ])
+                best_clear = np.maximum(best_clear, clear_k.astype(np.float32))
+            # wall_clear is in MILLIMETRES here (best clearance over the
+            # four turns, negative = the body overlaps a wall); the
+            # threshold below is in the same unit.
+            wall_clear = best_clear
+            wall_clear_px = cfg.object_wall_margin_mm + cfg.object_wall_scene_allowance_mm
+            wall_feasible_out = (wall_clear >= wall_clear_px).astype(np.uint8)
+        else:
+            # Fallback when no container mask exists: depth-proven-tall or
+            # large unknown regions act as the walls.
+            dv = (depth_roi > cfg.min_valid_depth_mm) & (depth_roi < cfg.max_valid_depth_mm)
+            tall = dv & (depth_roi < float(distance_mm) - cfg.object_wall_min_rise_mm)
+            unknown = ~dv
+            keep = ((tall | unknown) & (obj["mask"] == 0)).astype(np.uint8)
+            n_k, k_labels, k_stats, _ = cv2.connectedComponentsWithStats(keep, 8)
+            keep = np.isin(
+                k_labels, [i for i in range(1, n_k) if k_stats[i, 4] >= 60]
+            ).astype(np.uint8)
+            wall_clear = cv2.distanceTransform((1 - keep).astype(np.uint8), cv2.DIST_L2, 5)
+            wall_mask_out = keep
+            # Pixel units in this branch: scalar clearance to the tall stuff.
+            mm_per_px_w = float(distance_mm) / float(max(intrinsics["fx"], intrinsics["fy"]))
+            wall_clear_px = cfg.object_wall_clearance_mm / mm_per_px_w
 
     # Suction-cup grasp. Best-first; empty when the object is too small for the
     # cup or depth was too sparse to fit a plane, in which case the grasp point
@@ -655,10 +965,197 @@ def run_sam2_object_segmentation(
         distance_mm,
         dimensions,
         intrinsics,
+        keepout_clear=wall_clear,
+        keepout_min_px=wall_clear_px,
     )
+    # CENTRE-FIRST, GEOMETRY-ONLY primary (operator 2026-09-10, "the points
+    # we output must never fail"): the pick is the object's centre when the
+    # cup sits fully on the object there and, inside a box, the gripper body
+    # fits at some quarter turn; otherwise it is the NEAREST spot to the
+    # centre that passes both -- staying as close to the centre of gravity
+    # as the walls allow. No depth plane fit is required: a glossy top face
+    # blanks the stereo (16-00-10: 4298 valid px) and used to leave the
+    # object unpickable with "not scored, no retries". The cup edge margin
+    # is relaxed to zero only when a corner leaves no room with it.
+    def _ok_mask(edge_margin_mm):
+        mm_pp = float(distance_mm) / float(max(intrinsics["fx"], intrinsics["fy"]))
+        radius_px_ = max(int(round((cfg.obj_grasp_cup_diameter_mm / 2.0) / mm_pp)), 3)
+        margin_px_ = int(round(edge_margin_mm / mm_pp))
+        d_edge_ = cv2.distanceTransform(grasp_mask.astype(np.uint8), cv2.DIST_L2, 5)
+        ok = (grasp_mask > 0) & (d_edge_ >= radius_px_ + margin_px_)
+        if wall_clear is not None:
+            ok &= wall_clear >= wall_clear_px
+        return ok
+
+    primary = None
+    edge_margin_used = cfg.obj_grasp_edge_margin_mm
+    ok_used = None
+    if distance_mm is not None and intrinsics is not None:
+        ax, ay = int(grasp_anchor[0]), int(grasp_anchor[1])
+        for edge_margin in (cfg.obj_grasp_edge_margin_mm, 0.0):
+            ok = _ok_mask(edge_margin)
+            h_, w_ = ok.shape
+            if 0 <= ay < h_ and 0 <= ax < w_ and ok[ay, ax]:
+                primary = (ax, ay)
+            else:
+                oys, oxs = np.where(ok)
+                if oys.size:
+                    k_ = int(np.argmin((oxs - ax) ** 2 + (oys - ay) ** 2))
+                    primary = (int(oxs[k_]), int(oys[k_]))
+            if primary is not None:
+                edge_margin_used = edge_margin
+                ok_used = ok
+                break
+
+    if primary is not None:
+        grasp_anchor = primary
+        anchor_full_c = (cfg.roi_x1 + grasp_anchor[0], cfg.roi_y1 + grasp_anchor[1])
+        az, _ = center_depth_mm(cfg, depth_roi, grasp_mask, grasp_anchor)
+        if az is None:
+            az = distance_mm
+        ax_mm, ay_mm = pixel_to_camera_xy_mm(anchor_full_c, az, intrinsics)
+        centre_cand = {
+            "x_roi": int(grasp_anchor[0]), "y_roi": int(grasp_anchor[1]),
+            "x_mm": ax_mm, "y_mm": ay_mm, "z_mm": az,
+            "score": None, "point_full": anchor_full_c,
+        }
+        # Retries mirror the box-mode design (operator 2026-09-10): one
+        # offset ALONG THE HORIZONTAL through the centre, one along the
+        # VERTICAL -- a full cup diameter out, each trying the + side first
+        # and flipping if that point is off the object or violates the box
+        # wall clearance.
+        mm_pp = float(distance_mm) / float(max(intrinsics["fx"], intrinsics["fy"]))
+        off_px = cfg.obj_grasp_cup_diameter_mm / mm_pp
+        radius_px_r = max(int(round((cfg.obj_grasp_cup_diameter_mm / 2.0) / mm_pp)), 3)
+        margin_px_r = int(round(edge_margin_used / mm_pp))
+        d_edge_r = cv2.distanceTransform(grasp_mask.astype(np.uint8), cv2.DIST_L2, 5)
+        h_r, w_r = grasp_mask.shape
+        tail = []
+        axis_hits = {}
+        for dx, dy in ((1, 0), (0, 1)):
+            found = False
+            # ADAPTIVE offset: a narrow object cannot host a full-cup-out
+            # retry on its short axis -- shrink toward half a cup before
+            # giving the axis up.
+            for off_mm in (30.0, 25.0, 20.0, 15.0):
+                if found:
+                    break
+                o_px = off_mm / mm_pp
+                for sign in (1, -1):
+                    rx = int(round(grasp_anchor[0] + sign * o_px * dx))
+                    ry = int(round(grasp_anchor[1] + sign * o_px * dy))
+                    if not (0 <= ry < h_r and 0 <= rx < w_r):
+                        continue
+                    if grasp_mask[ry, rx] == 0:
+                        continue
+                    if d_edge_r[ry, rx] < radius_px_r + margin_px_r:
+                        continue
+                    if wall_clear is not None and wall_clear[ry, rx] < wall_clear_px:
+                        continue
+                    rz, _ = center_depth_mm(cfg, depth_roi, grasp_mask, (rx, ry))
+                    if rz is None:
+                        rz = distance_mm
+                    rp_full = (cfg.roi_x1 + rx, cfg.roi_y1 + ry)
+                    rx_mm, ry_mm = pixel_to_camera_xy_mm(rp_full, rz, intrinsics)
+                    tail.append({
+                        "x_roi": rx, "y_roi": ry,
+                        "x_mm": rx_mm, "y_mm": ry_mm, "z_mm": rz,
+                        "score": None, "point_full": rp_full,
+                    })
+                    found = True
+                    axis_hits[(dx, dy)] = (sign, off_mm)
+                    break
+        # When one axis cannot host a retry (narrow object), the working
+        # axis contributes its OPPOSITE side as the third point (operator
+        # 2026-09-10: two picks on the narrow tool should still be three).
+        if len(tail) < 2:
+            for (dx, dy), (used_sign, used_off) in list(axis_hits.items()):
+                sign = -used_sign
+                for off_mm in (used_off, 30.0, 25.0, 20.0, 15.0):
+                    o_px = off_mm / mm_pp
+                    rx = int(round(grasp_anchor[0] + sign * o_px * dx))
+                    ry = int(round(grasp_anchor[1] + sign * o_px * dy))
+                    if not (0 <= ry < h_r and 0 <= rx < w_r):
+                        continue
+                    if grasp_mask[ry, rx] == 0:
+                        continue
+                    if d_edge_r[ry, rx] < radius_px_r + margin_px_r:
+                        continue
+                    if wall_clear is not None and wall_clear[ry, rx] < wall_clear_px:
+                        continue
+                    rz, _ = center_depth_mm(cfg, depth_roi, grasp_mask, (rx, ry))
+                    if rz is None:
+                        rz = distance_mm
+                    rp_full = (cfg.roi_x1 + rx, cfg.roi_y1 + ry)
+                    rx_mm, ry_mm = pixel_to_camera_xy_mm(rp_full, rz, intrinsics)
+                    tail.append({
+                        "x_roi": rx, "y_roi": ry,
+                        "x_mm": rx_mm, "y_mm": ry_mm, "z_mm": rz,
+                        "score": None, "point_full": rp_full,
+                    })
+                    break
+                if len(tail) >= 2:
+                    break
+
+        # LAST RESORT (operator 2026-09-10, "never fail"): the axis scheme
+        # walks fixed offsets from the primary, which a corner can leave
+        # entirely outside the feasible zone (16-00-10: one pick, no
+        # retries). Fill the missing retries from the zone itself: the
+        # feasible pixel farthest from every pick chosen so far, as long
+        # as it is at least half a cup away, so a retry is still a
+        # different patch of the object. Every point here passes the same
+        # cup-on-object and wall-fit checks as the primary.
+        if len(tail) < 2 and ok_used is not None:
+            oys, oxs = np.where(ok_used)
+            if oys.size:
+                min_sep_px = (cfg.obj_grasp_cup_diameter_mm / 2.0) / mm_pp
+                chosen = [(float(grasp_anchor[0]), float(grasp_anchor[1]))] + [
+                    (float(c_["x_roi"]), float(c_["y_roi"])) for c_ in tail]
+                while len(tail) < 2:
+                    dmin = np.full(oxs.shape, np.inf)
+                    for cx_, cy_ in chosen:
+                        dmin = np.minimum(dmin, np.hypot(oxs - cx_, oys - cy_))
+                    k_ = int(np.argmax(dmin))
+                    if dmin[k_] < min_sep_px:
+                        break
+                    rx, ry = int(oxs[k_]), int(oys[k_])
+                    rz, _ = center_depth_mm(cfg, depth_roi, grasp_mask, (rx, ry))
+                    if rz is None:
+                        rz = distance_mm
+                    rp_full = (cfg.roi_x1 + rx, cfg.roi_y1 + ry)
+                    rx_mm, ry_mm = pixel_to_camera_xy_mm(rp_full, rz, intrinsics)
+                    tail.append({
+                        "x_roi": rx, "y_roi": ry,
+                        "x_mm": rx_mm, "y_mm": ry_mm, "z_mm": rz,
+                        "score": None, "point_full": rp_full,
+                    })
+                    chosen.append((float(rx), float(ry)))
+
+        grasp_candidates = [centre_cand] + tail
+
     best = grasp_candidates[0] if grasp_candidates else None
     if best is not None:
         grasp_x_mm, grasp_y_mm, grasp_z_mm = best["x_mm"], best["y_mm"], best["z_mm"]
+    elif wall_clear is not None:
+        # No scored candidate cleared the walls: take the mask pixel with the
+        # best wall clearance (ties broken toward the anchor) so the reported
+        # point is at least the SAFEST spot on the object.
+        mys, mxs = np.where(grasp_mask == 1)
+        if mys.size:
+            clear_vals = wall_clear[mys, mxs]
+            top = clear_vals >= np.percentile(clear_vals, 95)
+            cand_x, cand_y = mxs[top], mys[top]
+            d2 = (cand_x - grasp_anchor[0]) ** 2 + (cand_y - grasp_anchor[1]) ** 2
+            k = int(np.argmin(d2))
+            grasp_anchor = (int(cand_x[k]), int(cand_y[k]))
+        anchor_full = (
+            cfg.roi_x1 + grasp_anchor[0],
+            cfg.roi_y1 + grasp_anchor[1],
+        )
+        grasp_x_mm, grasp_y_mm = pixel_to_camera_xy_mm(
+            anchor_full, distance_mm, intrinsics
+        )
+        grasp_z_mm = distance_mm
     else:
         anchor_full = (
             cfg.roi_x1 + grasp_anchor[0],
@@ -672,6 +1169,11 @@ def run_sam2_object_segmentation(
     return {
         "roi_rgb": roi_rgb,
         "depth_roi": depth_roi,
+        "wall_mask": wall_mask_out,
+        "box_quad": box_quad,
+        "wall_feasible": wall_feasible_out,
+        "grasp_zone": ok_used,          # debug: where a pick may land
+        "grasp_mask_used": grasp_mask,  # debug: the mask picks were confined to
         "object": obj,
         "center_full": center_full,
         "distance_mm": distance_mm,
